@@ -1,728 +1,1352 @@
-/*
- * Qobuz HiFi API
- *
- * Drop-in, hifi-api-style Qobuz worker with:
- * - Multiple Qobuz user auth tokens
- * - Token failover / cooldown
- * - Catalog search
- * - Track / album / artist / playlist metadata
- * - ISRC -> exact Qobuz track resolution
- * - Qobuz stream URL resolution with 24/192 -> 24/96 -> CD -> MP3 fallback
- * - Short-lived stream URL memory cache only
- * - Long-lived metadata KV cache (shared GENERAL_MUSIC_CACHE)
- * - Request coalescing
- * - Retry/backoff for transient API failures
- * - CORS + HEAD + OPTIONS
- * - Artwork URL normalization
- * - Verified Qobuz catalog endpoints only
- * - Generated radio built from verified Qobuz catalog endpoints
- * - Explicit 501 responses for capabilities without a verified endpoint
- * - /ping token health testing
- *
- * Environment variables:
- *   QOBUZ_APP_ID
- *   QOBUZ_APP_SECRET
- *   QOBUZ_USER_AUTH_TOKEN
- *   QOBUZ_USER_AUTH_TOKEN_2 ... _10
- *   QOBUZ_APP_ID / QOBUZ_APP_ID_2 ... _10
- *   QOBUZ_APP_SECRET / QOBUZ_APP_SECRET_2 ... _10
- *
- * Required/optional KV:
- *   GENERAL_MUSIC_CACHE (shared with the Deezer worker)
- *
- * Notes:
- *   Qobuz stream URLs are signed/time-limited. Do NOT persist them in KV.
- *   Metadata is safe to cache for much longer.
- */
+// =========================================================================
+// Cloudflare Worker: Deezer High-Speed Playback Streamer & Deep Resolver
+// =========================================================================
 
-const API_VERSION = "4.0.0";
-const QOBUZ_BASE = "https://www.qobuz.com/api.json/0.2";
-const GENERAL_CACHE_PREFIX = "music:qobuz:";
+const DEEZER_GW = "https://www.deezer.com/ajax/gw-light.php";
+const DEEZER_MEDIA_API = "https://media.deezer.com/v1/get_url";
+const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
+const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
+
+// Cloudflare KV binding:
+//   GENERAL_MUSIC_CACHE
+// This namespace can be shared with the Qobuz worker. Deezer keys are
+// automatically prefixed with music:deezer: to prevent collisions.
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Range",
-  "Access-Control-Expose-Headers":
-    "Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag, Server-Timing, X-Qobuz-Token, X-Qobuz-Format, X-Qobuz-Cache",
+  "Access-Control-Expose-Headers": "Content-Length, Content-Type, Accept-Ranges, Content-Range",
 };
 
-const MAX_TOKENS = 10;
-const MEMORY_TRACK_CACHE_TTL = 30 * 60 * 1000;
-const STREAM_URL_CACHE_TTL = 20 * 1000;
-const TOKEN_COOLDOWN_MS = 30 * 1000;
-const MAX_MEMORY_TRACK_CACHE = 1000;
-const MAX_MEMORY_STREAM_CACHE = 250;
-const DEFAULT_LIMIT = 25;
-const MAX_LIMIT = 100;
+const BROWSER_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Origin": "https://www.deezer.com",
+  "Referer": "https://www.deezer.com/",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-origin",
+  "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+};
 
-const memoryTrackCache = new Map();
-const memoryStreamCache = new Map();
-const pendingLookups = new Map();
-const pendingStreams = new Map();
-const tokenState = new Map();
-const qobuzSessionCache = new Map();
-const QOBUZ_SESSION_TTL_MS = 20 * 60 * 1000;
+const QUALITY_MAP = {
+  "flac": { format: "FLAC", audioFormat: "FLAC", mime: "audio/flac", sampleRate: 44100, bitDepth: 16, bitrate: null, lossless: true, label: "16-bit / 44.1kHz Lossless", badge: "LOSSLESS" },
+  "lossless": { format: "FLAC", audioFormat: "FLAC", mime: "audio/flac", sampleRate: 44100, bitDepth: 16, bitrate: null, lossless: true, label: "16-bit / 44.1kHz Lossless", badge: "LOSSLESS" },
+  "hifi": { format: "FLAC", audioFormat: "FLAC", mime: "audio/flac", sampleRate: 44100, bitDepth: 16, bitrate: null, lossless: true, label: "16-bit / 44.1kHz Lossless", badge: "LOSSLESS" },
+  "320": { format: "MP3_320", audioFormat: "MP3", mime: "audio/mpeg", sampleRate: 44100, bitDepth: null, bitrate: 320, lossless: false, label: "320kbps MP3", badge: "HIGH" },
+  "320k": { format: "MP3_320", audioFormat: "MP3", mime: "audio/mpeg", sampleRate: 44100, bitDepth: null, bitrate: 320, lossless: false, label: "320kbps MP3", badge: "HIGH" },
+  "mp3_320": { format: "MP3_320", audioFormat: "MP3", mime: "audio/mpeg", sampleRate: 44100, bitDepth: null, bitrate: 320, lossless: false, label: "320kbps MP3", badge: "HIGH" },
+  "hq": { format: "MP3_320", audioFormat: "MP3", mime: "audio/mpeg", sampleRate: 44100, bitDepth: null, bitrate: 320, lossless: false, label: "320kbps MP3", badge: "HIGH" },
+  "128": { format: "MP3_128", audioFormat: "MP3", mime: "audio/mpeg", sampleRate: 44100, bitDepth: null, bitrate: 128, lossless: false, label: "128kbps MP3", badge: "LOW" },
+  "128k": { format: "MP3_128", audioFormat: "MP3", mime: "audio/mpeg", sampleRate: 44100, bitDepth: null, bitrate: 128, lossless: false, label: "128kbps MP3", badge: "LOW" },
+  "mp3_128": { format: "MP3_128", audioFormat: "MP3", mime: "audio/mpeg", sampleRate: 44100, bitDepth: null, bitrate: 128, lossless: false, label: "128kbps MP3", badge: "LOW" },
+  "standard": { format: "MP3_128", audioFormat: "MP3", mime: "audio/mpeg", sampleRate: 44100, bitDepth: null, bitrate: 128, lossless: false, label: "128kbps MP3", badge: "LOW" },
+};
 
-function jsonResponse(data, status = 200, extraHeaders = {}) {
+const sessionCache = new Map();
+const jwtCache = new Map();
+
+// Shared Cloudflare KV namespace used by both Deezer and Qobuz workers.
+// Keys are provider-prefixed so the two providers never overwrite each other.
+const GENERAL_CACHE_PREFIX = "music:deezer:";
+
+function sharedCacheKey(type, id) {
+  return `${GENERAL_CACHE_PREFIX}${type}:${String(id)}`;
+}
+
+async function getSharedCache(env, key) {
+  if (!env.GENERAL_MUSIC_CACHE) return null;
+  try {
+    return await env.GENERAL_MUSIC_CACHE.get(key, { type: "json" });
+  } catch (_) {
+    return null;
+  }
+}
+
+async function putSharedCache(env, key, value, ttlSeconds = 2592000) {
+  if (!env.GENERAL_MUSIC_CACHE) return;
+  try {
+    await env.GENERAL_MUSIC_CACHE.put(
+      key,
+      JSON.stringify(value),
+      { expirationTtl: Math.max(60, Math.floor(ttlSeconds)) }
+    );
+  } catch (_) {}
+}
+
+function normalizeSharedIsrc(isrc) {
+  return String(isrc || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+}
+
+function clearArlCache(arl) {
+  sessionCache.delete(arl);
+  jwtCache.delete(arl);
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+async function readResponse(response) {
+  const text = await response.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { status: response.status, ok: response.ok, text, json };
+}
+
+// -------------------------------------------------------------------------
+// SESSION & AUTHENTICATION (GATEWAY + PIPE GRAPHQL JWT)
+// -------------------------------------------------------------------------
+
+async function getOrRenewSession(arl, forceRefresh = false) {
+  const now = Date.now();
+  const cached = sessionCache.get(arl);
+
+  if (!forceRefresh && cached?.sid && cached.expiresAt > now) {
+    return cached;
+  }
+
+  const pingResp = await fetch(`${DEEZER_GW}?method=deezer.ping&input=3&api_version=1.0&api_token=`, {
+    method: "POST",
+    headers: { ...BROWSER_HEADERS, "Content-Type": "application/json" },
+    body: "{}",
+  });
+
+  const pingResult = await readResponse(pingResp);
+  const sid = pingResult.json?.results?.SESSION;
+  if (!sid) throw new Error("Deezer ping failed: Could not establish session.");
+
+  const userResp = await fetch(`${DEEZER_GW}?method=deezer.getUserData&input=3&api_version=1.0&api_token=null`, {
+    method: "POST",
+    headers: {
+      ...BROWSER_HEADERS,
+      "Content-Type": "application/json",
+      Cookie: `sid=${sid}; arl=${arl}`,
+    },
+    body: "{}",
+  });
+
+  const userResult = await readResponse(userResp);
+  const apiToken = userResult.json?.results?.checkForm;
+  const licenseToken = userResult.json?.results?.USER?.OPTIONS?.license_token;
+  const canLossless = userResult.json?.results?.USER?.OPTIONS?.can_stream_lossless;
+
+  if (!apiToken || !licenseToken) {
+    clearArlCache(arl);
+    throw new Error("Invalid or expired DEEZER_ARL cookie.");
+  }
+
+  const session = {
+    arl,
+    sid,
+    apiToken,
+    licenseToken,
+    canLossless: Boolean(canLossless),
+    expiresAt: now + 1000 * 60 * 60 * 2,
+  };
+
+  sessionCache.set(arl, session);
+  return session;
+}
+
+async function getPipeJwt(arl, forceRefresh = false) {
+  const now = Date.now();
+  const cached = jwtCache.get(arl);
+
+  if (!forceRefresh && cached?.jwt && cached.expiresAt > now) {
+    return cached.jwt;
+  }
+
+  try {
+    const renewResp = await fetch(DEEZER_AUTH_RENEW, {
+      method: "POST",
+      headers: {
+        ...BROWSER_HEADERS,
+        "Cookie": `arl=${arl}`,
+      },
+    });
+
+    const result = await readResponse(renewResp);
+    const jwt = result.json?.jwt;
+    if (jwt) {
+      jwtCache.set(arl, {
+        jwt,
+        expiresAt: now + 1000 * 60 * 45,
+      });
+      return jwt;
+    }
+  } catch {}
+
+  jwtCache.delete(arl);
+  return null;
+}
+
+// -------------------------------------------------------------------------
+// BLOWFISH STREAM CIPHER ENGINE
+// -------------------------------------------------------------------------
+
+function md5(str) {
+  const K = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) {
+    K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000);
+  }
+
+  const S = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
+  ];
+
+  const n = str.length;
+  const bitLen = n * 8;
+  const padLen = (((n + 8) >> 6) + 1) * 64;
+  const msg = new Uint8Array(padLen);
+  for (let i = 0; i < n; i++) msg[i] = str.charCodeAt(i);
+  msg[n] = 0x80;
+
+  const view = new DataView(msg.buffer);
+  view.setUint32(padLen - 8, bitLen >>> 0, true);
+  view.setUint32(padLen - 4, Math.floor(bitLen / 0x100000000) >>> 0, true);
+
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+
+  for (let offset = 0; offset < padLen; offset += 64) {
+    let a = a0, b = b0, c = c0, d = d0;
+    const M = new Uint32Array(16);
+    for (let j = 0; j < 16; j++) {
+      M[j] = view.getUint32(offset + j * 4, true);
+    }
+
+    for (let i = 0; i < 64; i++) {
+      let f, g;
+      if (i < 16) {
+        f = (b & c) | ((~b) & d);
+        g = i;
+      } else if (i < 32) {
+        f = (d & b) | ((~d) & c);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        f = b ^ c ^ d;
+        g = (3 * i + 5) % 16;
+      } else {
+        f = c ^ (b | (~d));
+        g = (7 * i) % 16;
+      }
+
+      const temp = (a + f + K[i] + M[g]) >>> 0;
+      a = d;
+      d = c;
+      c = b;
+      const s = S[i];
+      const rotated = ((temp << s) | (temp >>> (32 - s))) >>> 0;
+      b = (b + rotated) >>> 0;
+    }
+
+    a0 = (a0 + a) >>> 0;
+    b0 = (b0 + b) >>> 0;
+    c0 = (c0 + c) >>> 0;
+    d0 = (d0 + d) >>> 0;
+  }
+
+  const out = new DataView(new ArrayBuffer(16));
+  out.setUint32(0, a0, true);
+  out.setUint32(4, b0, true);
+  out.setUint32(8, c0, true);
+  out.setUint32(12, d0, true);
+
+  let hex = "";
+  for (let i = 0; i < 16; i++) {
+    hex += out.getUint8(i).toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+function deriveTrackKey(trackId) {
+  const md5Hex = md5(String(trackId));
+  const secret = "g4el58wc0zvf9na1";
+  const key = new Uint8Array(16);
+  for (let i = 0; i < 16; i++) {
+    key[i] = md5Hex.charCodeAt(i) ^ md5Hex.charCodeAt(i + 16) ^ secret.charCodeAt(i);
+  }
+  return key;
+}
+
+const BF_P_INIT = [
+  0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344, 0xa4093822, 0x299f31d0,
+  0x082efa98, 0xec4e6c89, 0x452821e6, 0x38d01377, 0xbe5466cf, 0x34e90c6c,
+  0xc0ac29b7, 0xc97c50dd, 0x3f84d5b5, 0xb5470917, 0x9216d5d9, 0x8979fb1b
+];
+
+const BF_S_BOXES_B64 = `
+0TELppjftawv/XLb0Brft7jhr+1qJn6WunyQRfEsf5kkoZlHs5Fs9wgB8uKFjvwWY2kg2HFXTmmkWP6j9JM9fg2VdI9yjrZY
+cYvNWIIVSu57VKQdwlpZtZww1Tkq8mATxdGwIyhghfDKQXkYuNs474553LBgOhgObJ4Oi7Aeij7XFXfBvTFLJ3ivL9pVYFxg
+5lUl86pVq5RXSJhiY+gUQFXKOWoqqxC2tMxcNBFB6M6hVIavfHLpk7PuFBFjb7wqK6nFXXQYMfbOXD4Wm4eTHq/WujNsJM9c
+ejJTgSiVhnc7j0iYa0u5r8S/6BtmKCGTYdgJzPshqZFIfKxgXeyAMu+EXV3phXWx3CYjAutlG4gjiT6B05asxQ9tb/OD9EI5
+LgtEgqSEIARpyPBKnh+bXiHGaEL26WyaZwycYavTiPBqUaDS2FQvaJYPpyirUTOjbu8LbBN6O+S6O/BQfvsqmKHxZR05rwF2
+ZspZPoJDDoiM7oYZRW+ftH2EpcM7i16+4G912IXBIHNAGkSfVsFqpk7TqmI2P3cGG/7fckKbAj030Nck0AoSSNsP6tNJ8cCb
+B1NyyYCZG3sl1HnY9uje9+P+UBq2eUw7l2zgvQTABrrBqU+2QJ9gxF5cnsIZaiRjaPtvrz5sU7UTObLrO1Lsb238UR+bMJUs
+zIFFRK9evQm+49AE3jNK/WYPKAcZLkuzwMuoV0XIdA/SC185udP721V5wL0aYDIK1qEAxkAscnlnnyX++x+jzI6l6fjbMiL4
+PHUW3/1haxUvUB7IrQVSqzI9tfr9I4dgUzF7SD4A34KeXFe7ym+MoBqHVi7fF2nb1UKo9ih+/8OsZzLGjE9Vc2lbJ7C7yljI
+4f+jXbjwEaAQ+j2Y/SGDuEr8tWwt0dNbmlPkebb4RWXSjkm8S/uXkOHd8tqky34zYvsTQc7kxujvIMraNndMAdB+nv4r8R+0
+ldvaTa6QkZjqrY5xa5PVoNCO0dCvxyXgjjxbL451lLeP9uL78hIrZIiIuBKQDfAcT61eoGiPwxzRz/GRs6jBrS8vIhi+Dhd3
+6nUt/osCH6HloMwPtW906Bis89bOieKZtKhP4P0T4Ld8xDuB0q2o2RZfomaAlXcFk8xzFCEaFHfmrSBld7X6hsdUQvX7nTXP
+682vDHs+iaDWQRvTrh5+SQAlDi0gcbNeImgAu1e44K8kZDab8Am5HlVjkR1Z36aqeMFDidlaU38gfVuiAuW5xYMmA3Zilc+p
+EcgZaE5zSkGzRy3KexSpShtRAFKaUykV1g9XP7ybxuQrYKR2geZ0AAi6b7VXG+kf8pbsayoN2RW2Y2Uh57n5tv80BS7FhVZk
+U7AtXamfj6EIukeZboUHakt6cOm1sylE23UJLsQZJiOtbqawSafffZzuYLiP7bJm7KqMcWmaF/9WZFJswrGe4Rk2AqV1CUwp
+oFkTQOQYOj4/VJiaW0KdZWuP5NaZ9z/WodKcB+/oMPVNLTjm8CVdwUzdIIaEcOsmY4LpxgIezF4JaGs/PrrvyTyXGBRranCh
+aH81hFKg4oa3nFMFqlAHNz4HhBx/3q5cjn1E7FcW8riwOto38FAMDfAcHwQCALP/rgz1Gjy1dLIlg3pY3AkhvdGRE/l8qS/2
+lDJHcyL1RwE65eWBN8La3Mi1djSa892nqURhRg/QAw7syMc+pHUeQeI4zZk76g4vMoC7oRg+szFOVIs4T225CG9CDQP2CgS/
+LLgSkCSXfHlWebByvK+Jr96adx/ZkwgQs4uuEtzPPy5VEnIfLmtxJFAa3eafhM2HelhHGHQI2he8n5q86Ut9jOx67DrbhR36
+YwlDZsRkw9LvHBhHMhXZCN1DOzckwroWEqFNQyplxFFQlAACEzrk3XHf+J4QMU5Vgax31l8RGZsENVbx16PHazwRGDtZJKUJ
+8o/m7Zfx+/qeur8sHhU8bobjRXDq6W+xhg5eClo+KrN3H+ccTj0G+ill3LmZ5x0PgD6J1lJmyCUuTMl4nBCzasYVDrqU4up4
+pfw8Ux4KLfTy906nNh0rPRk5Jg8ZwnlgUiOnCPcTErbrrf5u6sMfZuO8RZWme8iDsX830QGM/yjDMt3vvmxapWVYIYVoq5gC
+7s6lD9svlTsq732tW24vhBUhtigpB2Fw7N1HdWGfFRATzKgw62G9lgM0/h6qA2PPtXNckExwojnVnp4Ly6reFO7MhrxgYiyn
+nKtcq7LzhG5kix6vGb3wyqAjabllWrtQQGhaMjwqtLMxnunVwCG495tUCxmHX6CZlfeZfmI9faj4N4ial+MtdxHtk18WaBKB
+DjWIKcfmH9aW3t+heFi6mVf1hKUbInJjm4PD/xrCRpbNswrrUy4wVI/ZSORtvDEoWOvy7zTG/+r+KO1h7nw8c11KFNnoZLfj
+QhBdFCA+E+BF7uK2o6qr6ttsTxX6y0/Qx0L0Qu9qu7VlTzsdQc0hBdgeeZ6GhU3H5EtHaj2BYlDPYqHyW40mRvyIg6DBx7aj
+fxUkw2nLdJJHhIoLVpKyhQlbvwCtGUidFGKxdCOCDgBYQo0qDFX16h2t9D4jP3BhM3Lwko2TfkHWX+zxbCI723zeN1nL7nRg
+QIXyp853Mm6mB4CEGfhQnujv2FVh2Zc1qWmnqsUMBsJaBKv8gAvK3J5Eei7DRTSE/dVnBQ4ensnbc9vTEFWIzWdf2nnjZ0NA
+xcQ0ZXE+ONg9KPie8W3/IBU+IeePsD1K5uOfK9uDrffpPVpolIFA9/ZMJhyUaSk0QRUg93YC1Pe89Gsu1KIAaNQIJHEzIPRq
+Q7fUt1AAYa8eOfYulyRFRhQhT3S/i4hATZX8HZa1ka9w9N3TZqAvRb+8CewDvZeFf6xt0DHLhQSW6yezVf05QdolR+arygqa
+KFB4JVMEKfQKLIba6bZt+2jcFGLXSGkAaA7ApCehje5PP/6i6IetjLWM4AZ69Na2qs4efNM3X+zOeKOZQGsqQiD+njXZ84W5
+7jnXqzsSTosdyfr3S20YViajZjHq45eyOm76dN1bQzJoQef3yngg+/sK9U7Y/rOXRUBWrLpIlSdVUzo6IIONh/5rqbfQlpVL
+VahnvKEVmljMqSljmeHbM6YqSlY/MSX5XvR+HJApMXz9+OgCBCcvcIC7FVwFKCzjlcEVSOTGbSJIwRM/xw+G3Af5ye5BBB8P
+QEd5pF2IbhcyX1Hr1ZvA0fK8wY9BETVkJXt4NGAqnGDf+OijH2NsGw4StMIC4TKer2ZP0crRgRVrI5XgMz6S4TskC2Luvrki
+hbKiDua6DZnecgyMLaL3KNASeEWVt5T9ZH0IYufM9fBUSaNvh31I+sOd/SfzPo0eCkdjQZku/3Q6b26r9Pj9N6gS3GCh6934
+mRvhTNtuaw3Ge1UQbWcsNydl1Dvc0OgE8SkNx8wA/6O1OQ+SaQ/tC2Z7n/vO232coJHPC9kVXqO7Ey+IUVutJHuUeb92O9br
+Nzkus8wRWXmAJuKX9C4xLWhCrafGais7EnVMzHgu8RxqEkI3t5JR5wahu+ZL+2NQGmsQGBHK7fo9Jb3Y4uHDyURCFlkKEhOG
+2QzsbtWr6ipkr2dO2oaoX76/6Yhk5MP+nbyAV/D3wIZgeHv4YANgTdH9g0b2OB+wd0WuBNc2/MyDQmsz8B6rcbCAQYc8AF5f
+d6BXvr3oriRVRkKZv1guYU5Y9I/y3f2i9HTvOIeJvcJTZvnDyLOOdLR18lVG/Nm5eusmYYsd34SEag55kV+V4kZuWY4gtFdw
+jNVVkckC3ky5C6zhu4IF0BGoYkh1dKmet38ZtuCp3AlmLQmhxDJGM+haHwIJ8L6MSpmgJR1u/hAauT0dC6Wk36GG8g8oaPFp
+3Lfag1c5Bv6h4s6bT81/UlARXgGnBoP6oAK1xA3m0Cea+Iwndz+GQcNgTAZhqAa18Bd6KMD1huAAYFiqMNx9YhHmntcjOOpj
+U8LdlMLCFjS7y+5WkLy23uv8faHOWR12bwXkCUt8AYg5cgo9fJJ8JIbjcl9yTZ25GsFbtNOeuPztVFV4CPyltdg9fNNNrQ/E
+HlDvXrFh5viihRTZbFETPG/Vx+dW4U7ENiq/zt3GyDfXmjI0kmOCEmcO+o5AYADgOjnON9P69c+rwnc3WsUtG1ywZ55PozdC
+04InQJm8m77VEY6dvw9zFdYtHH7HAMR7t4wbayGhkEWybrG+ajZutFdIqy+8lG55xqN20mVJwshTD/juRo3efdVzCh1M0E3G
+KTm726m6RlCslSbovl7jBKH61fBqLVGaY++M4pqG7iLAicK4QyQu9qUeA6qc8tCkg8Bhupvpak2P5RVQumRb1igmovmnOjrh
+S6mVhu9VYunHL+/T91L32j8Eb2l3+gpZgOSpFYewhgGbCeatOz7lk+mQ/VqeNNeXLPC32QIri1GW1aw6AX2mfdHPPtZ8fS0o
+H58lz63yuJta1rRyWoj1TOAprHHgGaXmR7Cs/e2T+pvo08SNKDtXzPjVZil5Ey4oeF8Bke11YFX3lg5E49NejBUFbdSI9G26
+A6FhJQVk8L3D654VPJBXopcnGuypOgcqGz9tmx5jIfX1nGb7JtzzGXUz2SixVf31A1Y0goq6PLsoUXcRwgrZ+KvMUWfMrZJf
+TegXUTgw3I43nVhikyD5kep6kML7PnvOUSHOZHdPvjKotuN+wyk9RkjeU2lkE+aAoq4IEN1tsiRphS39CQchZrOaRgpkRcDd
+WGzezxwgyK5bvvfdG1iNQMzSAX9rtOO73aJqfjpZ/0U+NQpEvLTN1XLqzqj6ZIS7jWYSrr88b0fSm+RjVC9dnq7Cdxv2TmNw
+dA4NjedbE1f4chZxr1N9XUBAywhOtOLMNNJGagEVr4ThsAQolZg6HQa4n7TObqBIbz87gjUgq4IBGh1LJ3In+GEVYLHnkz/c
+uzp5KzRFJb2giDnhUc55Sy8yybegH7rJ4BzIfrzH0fbPARHDoeiqxxqQh0nUT72a0Nrey9UK2jgDOcMqxpE2Z435MXzgsStP
+955Zt0P1uzry1Rn/J9lFnL+XIiwV5vwqD5H8cZuUFSX65ZNhzrac68KoZFkSuqjRtsEHXuMFagwQ0lBlywOkQuDsbg4WmNs7
+TJigvjJ46WSfH5Uy4NOS39OgNCuJcfIeGwp0QUujNIzFvnEgw3Yy2N81n42bmS8u5gtvRw/j8R3lTNpUHtrYkc5iec/NPn5v
+FhixZv0sHQWEj9LF9vsimfUj81emMnYjk6g1MVbMzQKs8IFiWnXrtW4WNpeI0nPM3pZikoG5SdBMUJAbccZWFObGx70yehQK
+ReHQBsPye5rJqlP9YqgPALslv+I1vdL2cRJpBbIEAiK2y898zXacK1MRPsAWQOPTOKu9YCVHrfC6OCCc90bOdnevocUgdWBg
+hcv+Torojdh6qvmwTPmqfhlIwlwC+4qMAcNq5Nbr4fmQ1PhpplzeoD8JJS3CCOaft05hMs534ltXj9/jOsNy5g==
+`;
+
+function decodeBase64(value) {
+  const normalized = String(value)
+    .replace(/\s+/g, "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
+    throw new Error("Invalid BF_S_BOXES_B64: unexpected Base64 character");
+  }
+
+  if (normalized.length % 4 === 1) {
+    throw new Error("Invalid BF_S_BOXES_B64: invalid Base64 length");
+  }
+
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  return atob(padded);
+}
+
+const GLOBAL_TABLES = (function () {
+  const binary = decodeBase64(BF_S_BOXES_B64);
+  const buffer = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) buffer[i] = binary.charCodeAt(i);
+  const view = new DataView(buffer.buffer);
+  const sBoxes = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+  let offset = 0;
+  for (let b = 0; b < 4; b++) {
+    for (let i = 0; i < 256; i++) {
+      sBoxes[b][i] = view.getUint32(offset, false);
+      offset += 4;
+    }
+  }
+  return { pArray: new Uint32Array(BF_P_INIT), sBoxes };
+})();
+
+class FastBlowfish {
+  constructor(keyBytes) {
+    this.p = new Uint32Array(GLOBAL_TABLES.pArray);
+    this.s0 = new Uint32Array(GLOBAL_TABLES.sBoxes[0]);
+    this.s1 = new Uint32Array(GLOBAL_TABLES.sBoxes[1]);
+    this.s2 = new Uint32Array(GLOBAL_TABLES.sBoxes[2]);
+    this.s3 = new Uint32Array(GLOBAL_TABLES.sBoxes[3]);
+    this.initKey(keyBytes);
+  }
+
+  encBlock(xl, xr) {
+    const s0 = this.s0, s1 = this.s1, s2 = this.s2, s3 = this.s3, p = this.p;
+    for (let i = 0; i < 16; i++) {
+      xl ^= p[i];
+      const a = (xl >>> 24) & 0xff, b = (xl >>> 16) & 0xff, c = (xl >>> 8) & 0xff, d = xl & 0xff;
+      const f = (((s0[a] + s1[b]) ^ s2[c]) + s3[d]) >>> 0;
+      xr = (f ^ xr) >>> 0;
+      const tmp = xl; xl = xr; xr = tmp;
+    }
+    const tmp = xl; xl = xr; xr = tmp;
+    return [(xl ^ p[17]) >>> 0, (xr ^ p[16]) >>> 0];
+  }
+
+  initKey(key) {
+    let keyIdx = 0;
+    for (let i = 0; i < 18; i++) {
+      let data = 0;
+      for (let k = 0; k < 4; k++) {
+        data = ((data << 8) | key[keyIdx]) >>> 0;
+        keyIdx = (keyIdx + 1) % key.length;
+      }
+      this.p[i] ^= data;
+    }
+    let block = [0, 0];
+    for (let i = 0; i < 18; i += 2) {
+      block = this.encBlock(block[0], block[1]);
+      this.p[i] = block[0]; this.p[i + 1] = block[1];
+    }
+    for (let s = 0; s < 4; s++) {
+      const currentS = s === 0 ? this.s0 : s === 1 ? this.s1 : s === 2 ? this.s2 : this.s3;
+      for (let i = 0; i < 256; i += 2) {
+        block = this.encBlock(block[0], block[1]);
+        currentS[i] = block[0]; currentS[i + 1] = block[1];
+      }
+    }
+  }
+
+  decryptCBC(view, offset) {
+    let ivL = 0x00010203, ivR = 0x04050607;
+    const p = this.p;
+    const s0 = this.s0, s1 = this.s1, s2 = this.s2, s3 = this.s3;
+
+    for (let i = 0; i < 2048; i += 8) {
+      const pos = offset + i;
+      const cL = view.getUint32(pos, false);
+      const cR = view.getUint32(pos + 4, false);
+
+      let A = cL ^ p[17];
+      let B = cR ^ p[16];
+
+      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[15];
+      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[14];
+      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[13];
+      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[12];
+      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[11];
+      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[10];
+      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[9];
+      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[8];
+      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[7];
+      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[6];
+      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[5];
+      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[4];
+      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[3];
+      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[2];
+      B = ((((s0[(A >>> 24) & 0xff] + s1[(A >>> 16) & 0xff]) ^ s2[(A >>> 8) & 0xff]) + s3[A & 0xff]) ^ B) >>> 0; A ^= p[1];
+      A = ((((s0[(B >>> 24) & 0xff] + s1[(B >>> 16) & 0xff]) ^ s2[(B >>> 8) & 0xff]) + s3[B & 0xff]) ^ A) >>> 0; B ^= p[0];
+
+      view.setUint32(pos, ((B ^ ivL) >>> 0), false);
+      view.setUint32(pos + 4, ((A ^ ivR) >>> 0), false);
+      ivL = cL; ivR = cR;
+    }
+  }
+}
+
+function decryptAlignedBuffer(cipher, buffer, startBlock) {
+  const numBlocks = Math.floor(buffer.length / 2048);
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+
+  for (let i = 0; i < numBlocks; i++) {
+    const currentBlock = startBlock + i;
+    if (currentBlock % 3 === 0) {
+      cipher.decryptCBC(view, i * 2048);
+    }
+  }
+}
+
+// -------------------------------------------------------------------------
+// ARTWORK HELPER (UP TO 1900x1900 ULTRA HD)
+// -------------------------------------------------------------------------
+
+function buildArtworkUrls(rawIdOrUrl, type = "cover") {
+  if (!rawIdOrUrl) return null;
+  let md5Hash = String(rawIdOrUrl);
+
+  const hashMatch = md5Hash.match(/([a-f0-9]{32})/i);
+  if (hashMatch) {
+    md5Hash = hashMatch[1];
+  } else if (rawIdOrUrl.startsWith("http")) {
+    return {
+      ultra: rawIdOrUrl.replace(/\/\d+x\d+-/, "/1900x1900-"),
+      xl: rawIdOrUrl.replace(/\/\d+x\d+-/, "/1000x1000-"),
+      large: rawIdOrUrl.replace(/\/\d+x\d+-/, "/500x500-"),
+      medium: rawIdOrUrl.replace(/\/\d+x\d+-/, "/250x250-"),
+      small: rawIdOrUrl.replace(/\/\d+x\d+-/, "/56x56-"),
+      default: rawIdOrUrl.replace(/\/\d+x\d+-/, "/1000x1000-"),
+    };
+  } else {
+    return null;
+  }
+
+  const endpoint = type === "artist" ? "artist" : "cover";
+  return {
+    ultra: `https://e-cdns-images.dzcdn.net/images/${endpoint}/${md5Hash}/1900x1900-000000-80-0-0.jpg`,
+    xl: `https://e-cdns-images.dzcdn.net/images/${endpoint}/${md5Hash}/1000x1000-000000-80-0-0.jpg`,
+    large: `https://e-cdns-images.dzcdn.net/images/${endpoint}/${md5Hash}/500x500-000000-80-0-0.jpg`,
+    medium: `https://e-cdns-images.dzcdn.net/images/${endpoint}/${md5Hash}/250x250-000000-80-0-0.jpg`,
+    small: `https://e-cdns-images.dzcdn.net/images/${endpoint}/${md5Hash}/56x56-000000-80-0-0.jpg`,
+    default: `https://e-cdns-images.dzcdn.net/images/${endpoint}/${md5Hash}/1000x1000-000000-80-0-0.jpg`,
+  };
+}
+
+// -------------------------------------------------------------------------
+// TRACK DISCOVERY (ID / ISRC / QUERY + ARTIST)
+// -------------------------------------------------------------------------
+
+async function discoverTrack({ id, isrc, query, artist }, env = null) {
+  const cleanId = id ? String(id).trim() : "";
+  const cleanIsrc = normalizeSharedIsrc(isrc);
+  const cleanQuery = query ? String(query).trim() : "";
+  const cleanArtist = artist ? String(artist).trim() : "";
+
+  // Stable track metadata can safely live in the shared KV. Signed playback
+  // URLs are never stored here.
+  const cacheId = cleanId
+    ? sharedCacheKey("track", `id:${cleanId}`)
+    : cleanIsrc
+      ? sharedCacheKey("track", `isrc:${cleanIsrc}`)
+      : null;
+
+  if (cacheId) {
+    const cached = await getSharedCache(env, cacheId);
+    if (cached?.id) return cached;
+  }
+
+  let found = null;
+
+  if (cleanId) {
+    const resp = await fetch(`https://api.deezer.com/track/${encodeURIComponent(cleanId)}`, {
+      headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+    });
+    const result = await readResponse(resp);
+    if (result.json?.id) found = result.json;
+  }
+
+  if (!found && cleanIsrc) {
+    const resp = await fetch(`https://api.deezer.com/track/isrc:${encodeURIComponent(cleanIsrc)}`, {
+      headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+    });
+    const result = await readResponse(resp);
+    if (result.json?.id) found = result.json;
+  }
+
+  if (!found && (cleanQuery || cleanArtist)) {
+    let qTerm = "";
+    if (cleanQuery && cleanArtist) {
+      qTerm = `track:"${cleanQuery}" artist:"${cleanArtist}"`;
+    } else if (cleanQuery) {
+      qTerm = cleanQuery;
+    } else {
+      qTerm = `artist:"${cleanArtist}"`;
+    }
+
+    let resp = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(qTerm)}`, {
+      headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+    });
+    let result = await readResponse(resp);
+    if (result.json?.data?.length > 0) found = result.json.data[0];
+
+    if (!found && cleanQuery && cleanArtist) {
+      resp = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(`${cleanQuery} ${cleanArtist}`)}`, {
+        headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+      });
+      result = await readResponse(resp);
+      if (result.json?.data?.length > 0) found = result.json.data[0];
+    }
+  }
+
+  if (found?.id) {
+    if (cacheId) await putSharedCache(env, cacheId, found);
+    const foundIsrc = normalizeSharedIsrc(found.isrc || found.ISRC || cleanIsrc);
+    if (foundIsrc) {
+      await putSharedCache(env, sharedCacheKey("track", `isrc:${foundIsrc}`), found);
+    }
+    await putSharedCache(env, sharedCacheKey("track", `id:${found.id}`), found);
+  }
+
+  return found;
+}
+
+// -------------------------------------------------------------------------
+// DEEZER GRAPHQL LYRICS (WORD-BY-WORD & LINE-BY-LINE)
+// -------------------------------------------------------------------------
+
+const GQL_LYRICS_QUERY = `
+query GetLyrics($trackId: String!) {
+  track(trackId: $trackId) {
+    id
+    lyrics {
+      id
+      text
+      copyright
+      writers
+      synchronizedLines {
+        lrcTimestamp
+        line
+        lineTranslated
+        milliseconds
+        duration
+      }
+      synchronizedWordByWordLines {
+        start
+        end
+        words {
+          start
+          end
+          word
+        }
+      }
+    }
+  }
+}
+`;
+
+function normalizeLyricsLines(lines) {
+  if (!Array.isArray(lines)) return null;
+  return lines.map((line) => ({
+    ...line,
+    milliseconds: Number.isFinite(Number(line?.milliseconds)) ? Number(line.milliseconds) : null,
+    duration: Number.isFinite(Number(line?.duration)) ? Number(line.duration) : null,
+  }));
+}
+
+function normalizeWordSync(lines) {
+  if (!Array.isArray(lines)) return null;
+  return lines.map((line) => ({
+    start: Number.isFinite(Number(line?.start)) ? Number(line.start) : line?.start ?? null,
+    end: Number.isFinite(Number(line?.end)) ? Number(line.end) : line?.end ?? null,
+    words: Array.isArray(line?.words) ? line.words.map((word) => ({
+      start: Number.isFinite(Number(word?.start)) ? Number(word.start) : word?.start ?? null,
+      end: Number.isFinite(Number(word?.end)) ? Number(word.end) : word?.end ?? null,
+      word: word?.word ?? "",
+    })) : [],
+  }));
+}
+
+function wordSyncToLrc(wordLines) {
+  if (!Array.isArray(wordLines) || !wordLines.length) return null;
+  const lines = [];
+  for (const line of wordLines) {
+    const words = Array.isArray(line.words) ? line.words : [];
+    if (!words.length) continue;
+    const start = Number(line.start);
+    const ms = Number.isFinite(start) ? start : Number(words[0]?.start);
+    const timestamp = Number.isFinite(ms) ? `[${Math.floor(ms / 60000).toString().padStart(2, "0")}:${((ms % 60000) / 1000).toFixed(2).padStart(5, "0")}]` : "";
+    lines.push(`${timestamp}${words.map(w => w.word || "").join("")}`);
+  }
+  return lines.length ? lines.join("\n") : null;
+}
+
+async function getLyricsFromPipeGQL(arl, trackId) {
+  const jwt = await getPipeJwt(arl);
+  if (!jwt) return null;
+
+  try {
+    const resp = await fetch(DEEZER_PIPE_GQL, {
+      method: "POST",
+      headers: {
+        ...BROWSER_HEADERS,
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${jwt}`,
+      },
+      body: JSON.stringify({
+        operationName: "GetLyrics",
+        variables: { trackId: String(trackId) },
+        query: GQL_LYRICS_QUERY,
+      }),
+    });
+
+    const result = await readResponse(resp);
+    const lyricsObj = result.json?.data?.track?.lyrics;
+    if (!lyricsObj) return null;
+
+    const wordSync = normalizeWordSync(lyricsObj.synchronizedWordByWordLines);
+    const lineSync = normalizeLyricsLines(lyricsObj.synchronizedLines);
+    let lrc = null;
+
+    // Word-level timing is the most precise representation. Prefer it over
+    // line timing so clients that only consume `lrc` still receive the most
+    // detailed timing available from Deezer.
+    if (wordSync?.length) {
+      lrc = wordSyncToLrc(wordSync);
+    } else if (lineSync?.length) {
+      lrc = lineSync.map(l => `${l.lrcTimestamp || ""}${l.line || ""}`).join("\n");
+    }
+
+    return {
+      source: "deezer_graphql",
+      id: lyricsObj.id ?? null,
+      syncType: wordSync?.length ? "WORD_BY_WORD" : lineSync?.length ? "LINE_BY_LINE" : "UNSYNCED",
+      hasWordSync: Boolean(wordSync?.length),
+      hasLineSync: Boolean(lineSync?.length),
+      writers: lyricsObj.writers ?? null,
+      copyright: lyricsObj.copyright ?? null,
+      plain: lyricsObj.text ?? null,
+      lrc,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getLyricsFromLRCLIB(title, artist, duration, isrc) {
+  try {
+    const params = new URLSearchParams();
+    if (isrc) params.set("isrc", isrc);
+    if (title) params.set("track_name", title);
+    if (artist) params.set("artist_name", artist);
+    if (duration) params.set("duration", Math.round(duration));
+
+    const resp = await fetch(`https://lrclib.net/api/get?${params.toString()}`, {
+      headers: { "User-Agent": "CloudflareWorker-DeezerStreamer/2.0" },
+    });
+
+    const result = await readResponse(resp);
+    if (result.json?.id) {
+      const synced = result.json.syncedLyrics || null;
+      return {
+        source: "lrclib",
+        id: result.json.id,
+        syncType: synced ? "LINE_BY_LINE" : "UNSYNCED",
+        hasWordSync: false,
+        hasLineSync: Boolean(synced),
+        writers: result.json.writers ?? null,
+        copyright: result.json.copyright ?? null,
+        plain: result.json.plainLyrics || null,
+        lrc: synced,
+      };
+    }
+  } catch {}
+  return null;
+}
+
+// -------------------------------------------------------------------------
+// AUTOPLAY & RADIO ENGINE
+// -------------------------------------------------------------------------
+
+async function getAutoplayRadio(artistId, currentTrackId, reqOrigin, currentQuality) {
+  if (!artistId) return [];
+
+  let rawTracks = [];
+
+  // 1. Fetch artist radio (mixes artist tracks + similar artists)
+  try {
+    const radioResp = await fetch(`https://api.deezer.com/artist/${artistId}/radio`, {
+      headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+    });
+    const result = await readResponse(radioResp);
+    if (Array.isArray(result.json?.data) && result.json.data.length > 0) {
+      rawTracks = result.json.data;
+    }
+  } catch {}
+
+  // 2. Fallback: Artist Top Tracks
+  if (rawTracks.length === 0) {
+    try {
+      const topResp = await fetch(`https://api.deezer.com/artist/${artistId}/top?limit=25`, {
+        headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+      });
+      const result = await readResponse(topResp);
+      if (Array.isArray(result.json?.data)) {
+        rawTracks = result.json.data;
+      }
+    } catch {}
+  }
+
+  // Filter out the currently playing track
+  const filtered = rawTracks.filter(t => String(t.id) !== String(currentTrackId));
+
+  return filtered.map(item => ({
+    id: String(item.id),
+    title: item.title,
+    artist: {
+      id: String(item.artist?.id),
+      name: item.artist?.name,
+      artwork: buildArtworkUrls(item.artist?.picture_xl || item.artist?.picture, "artist"),
+    },
+    album: {
+      id: String(item.album?.id),
+      title: item.album?.title,
+      artwork: buildArtworkUrls(item.album?.cover_xl || item.album?.cover, "cover"),
+    },
+    duration: item.duration,
+    explicit: Boolean(item.explicit_lyrics),
+    streamUrl: `${reqOrigin}/stream-track?id=${item.id}&quality=${encodeURIComponent(currentQuality || "flac")}`,
+    resolveUrl: `${reqOrigin}/?id=${item.id}&quality=${encodeURIComponent(currentQuality || "flac")}`,
+  }));
+}
+
+// -------------------------------------------------------------------------
+// TRACK TOKENS & STREAM RESOLUTION
+// -------------------------------------------------------------------------
+
+async function getTrackTokens(arl, session, trackId) {
+  const idNum = parseInt(trackId, 10) || trackId;
+  const listUrl = `${DEEZER_GW}?method=song.getListData&input=3&api_version=1.0&api_token=${session.apiToken}`;
+
+  const response = await fetch(listUrl, {
+    method: "POST",
+    headers: {
+      ...BROWSER_HEADERS,
+      "Content-Type": "application/json",
+      Cookie: `sid=${session.sid}; arl=${arl}`,
+    },
+    body: JSON.stringify({ sng_ids: [idNum] }),
+  });
+
+  const result = await readResponse(response);
+  let trackData = result.json?.results?.data?.[0];
+  if (trackData?.FALLBACK) trackData = { ...trackData, ...trackData.FALLBACK };
+  return trackData;
+}
+
+async function resolveMediaStream(licenseToken, trackToken, targetFormat) {
+  const payload = {
+    license_token: licenseToken,
+    media: [
+      {
+        type: "FULL",
+        formats: [{ cipher: "BF_CBC_STRIPE", format: targetFormat }],
+      },
+    ],
+    track_tokens: [trackToken],
+  };
+
+  const response = await fetch(DEEZER_MEDIA_API, {
+    method: "POST",
+    headers: {
+      ...BROWSER_HEADERS,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const result = await readResponse(response);
+  const mediaItem = result.json?.data?.[0]?.media?.[0];
+  if (mediaItem?.sources?.[0]?.url) {
+    return {
+      directCdnUrl: mediaItem.sources[0].url,
+      format: mediaItem.format,
+    };
+  }
+
+  const rawError = result.json?.data?.[0]?.errors?.[0] || result.json || result.text;
+  throw new Error(`Media resolution for ${targetFormat} failed: ${typeof rawError === "object" ? JSON.stringify(rawError) : rawError}`);
+}
+
+function firstValue(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+  }
+  return null;
+}
+
+function toNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeContributors(raw) {
+  if (!raw) return [];
+  const result = [];
+
+  // Deezer REST Track objects return contributors as an array of artist objects.
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (!item) continue;
+      if (typeof item === "object") {
+        result.push({ ...item, role: item.role || "artist" });
+      } else if (String(item).trim()) {
+        result.push({ role: "artist", name: String(item) });
+      }
+    }
+    return result;
+  }
+
+  if (typeof raw !== "object") return [];
+
+  // song.getListData may return contributors grouped by role.
+  for (const [role, names] of Object.entries(raw)) {
+    if (Array.isArray(names)) {
+      for (const item of names) {
+        if (!item) continue;
+        if (typeof item === "object") {
+          result.push({ role, ...item });
+        } else if (String(item).trim()) {
+          result.push({ role, name: String(item) });
+        }
+      }
+    } else if (names !== null && names !== undefined && String(names).trim()) {
+      result.push({ role, name: String(names) });
+    }
+  }
+  return result;
+}
+
+function contributorNamesForRole(contributors, rolePattern) {
+  if (!Array.isArray(contributors)) return [];
+  const pattern = rolePattern instanceof RegExp ? rolePattern : new RegExp(String(rolePattern), "i");
+  return contributors
+    .filter(c => pattern.test(String(c?.role || c?.ROLE || "")))
+    .map(c => c?.name || c?.ART_NAME || c?.artist?.name)
+    .filter(Boolean)
+    .map(String);
+}
+
+async function getAlbumMetadata(albumId) {
+  if (!albumId) return null;
+  try {
+    const resp = await fetch(`https://api.deezer.com/album/${encodeURIComponent(albumId)}`, {
+      headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
+    });
+    const result = await readResponse(resp);
+    if (result.json?.id) return result.json;
+  } catch {}
+  return null;
+}
+
+function buildRichMetadata(trackData, track, albumData, finalLyrics) {
+  const rawContributors = firstValue(
+    trackData?.SNG_CONTRIBUTORS,
+    trackData?.CONTRIBUTORS,
+    trackData?.contributors,
+    track?.contributors
+  );
+  const contributors = normalizeContributors(rawContributors);
+  const contributorText = contributors
+    .map(c => c?.name || c?.ART_NAME || c?.artist?.name)
+    .filter(Boolean)
+    .map(String);
+
+  const writerValue = firstValue(
+    trackData?.SNG_WRITERS,
+    trackData?.WRITERS,
+    trackData?.writers,
+    track?.writers,
+    finalLyrics?.writers,
+    contributorNamesForRole(contributors, /writer|songwriter|composer|lyricist|author/i)
+  );
+
+  const copyright = firstValue(
+    trackData?.COPYRIGHT,
+    trackData?.SNG_COPYRIGHT,
+    trackData?.COPYRIGHT_TEXT,
+    trackData?.COPYRIGHT_HOLDER,
+    trackData?.copyright,
+    track?.copyright,
+    albumData?.copyright,
+    finalLyrics?.copyright
+  );
+
+  const label = firstValue(
+    trackData?.LABEL_NAME,
+    trackData?.LABEL,
+    trackData?.label,
+    trackData?.ALB_LABEL,
+    trackData?.ALBUM_LABEL,
+    albumData?.label
+  );
+
+  const distributor = firstValue(
+    trackData?.DISTRIBUTOR,
+    trackData?.DISTRIBUTOR_NAME,
+    trackData?.distribution,
+    trackData?.DISTRIBUTION,
+    track?.distributor,
+    albumData?.distributor
+  );
+
+  const publisher = firstValue(
+    trackData?.PUBLISHER,
+    trackData?.PUBLISHER_NAME,
+    trackData?.publishing,
+    trackData?.PUBLISHING,
+    track?.publisher,
+    albumData?.publisher
+  );
+
+  const authorNotes = firstValue(
+    trackData?.AUTHOR_NOTES,
+    trackData?.AUTHORS_NOTES,
+    trackData?.AUTHOR_NOTE,
+    trackData?.NOTES,
+    trackData?.NOTE,
+    trackData?.authorNotes,
+    trackData?.notes,
+    track?.authorsNotes,
+    albumData?.authorsNotes
+  );
+
+  return {
+    contributors: contributors.length ? contributors : null,
+    writers: Array.isArray(writerValue) ? writerValue : (writerValue ?? (contributorText.length ? contributorText : null)),
+    copyright: copyright ?? null,
+    label: label ?? null,
+    distributor: distributor ?? null,
+    publisher: publisher ?? null,
+    authorsNotes: authorNotes ?? null,
+    rawCredits: rawContributors ?? null,
+  };
+}
+
+function sanitizeSourceMetadata(value) {
+  if (!value || typeof value !== "object") return null;
+  const blocked = /(token|jwt|arl|password|secret|license|credential|cookie|authorization)/i;
+  const out = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (blocked.test(key)) continue;
+    if (typeof val === "function") continue;
+    out[key] = val;
+  }
+  return out;
+}
+
+// -------------------------------------------------------------------------
+// ARL HEALTH / PING
+// -------------------------------------------------------------------------
+
+function getConfiguredArls(env) {
+  const arls = [];
+  for (let i = 0; i < 10; i++) {
+    const name = i === 0 ? "DEEZER_ARL" : `DEEZER_ARL_${i + 1}`;
+    const value = env[name]?.trim();
+    if (value) {
+      arls.push({ slot: i + 1, name, value });
+    }
+  }
+  return arls;
+}
+
+async function pingArlDirect(arl, slot, variableName) {
+  const started = Date.now();
+
+  try {
+    // Create a brand-new Deezer session for THIS environment variable.
+    // This deliberately bypasses the playback session cache, so every ARL is
+    // actually tested independently.
+    const pingResp = await fetch(
+      `${DEEZER_GW}?method=deezer.ping&input=3&api_version=1.0&api_token=`,
+      {
+        method: "POST",
+        headers: { ...BROWSER_HEADERS, "Content-Type": "application/json" },
+        body: "{}",
+      }
+    );
+
+    const pingResult = await readResponse(pingResp);
+    const sid = pingResult.json?.results?.SESSION;
+    if (!sid) {
+      return {
+        slot,
+        variable: variableName,
+        status: "failed",
+        latency_ms: Date.now() - started,
+        error: "Deezer session could not be created",
+      };
+    }
+
+    const userResp = await fetch(
+      `${DEEZER_GW}?method=deezer.getUserData&input=3&api_version=1.0&api_token=null`,
+      {
+        method: "POST",
+        headers: {
+          ...BROWSER_HEADERS,
+          "Content-Type": "application/json",
+          Cookie: `sid=${sid}; arl=${arl}`,
+        },
+        body: "{}",
+      }
+    );
+
+    const userResult = await readResponse(userResp);
+    const user = userResult.json?.results?.USER;
+    const apiToken = userResult.json?.results?.checkForm;
+    const licenseToken = user?.OPTIONS?.license_token;
+    const ok = Boolean(user && apiToken && licenseToken);
+
+    if (!ok) {
+      return {
+        slot,
+        variable: variableName,
+        status: "expired_or_invalid",
+        latency_ms: Date.now() - started,
+        can_lossless: false,
+        lossless_check: "authentication_failed",
+        user_id: user?.USER_ID ?? user?.id ?? null,
+        error: "Invalid or expired Deezer ARL",
+      };
+    }
+
+    // Real lossless capability test. Authenticate this ARL, obtain the
+    // playback token for a known Deezer FLAC track, then ask Deezer's media
+    // endpoint for FLAC. We only mark the account as lossless-capable when
+    // Deezer actually returns a FLAC source for the test track.
+    let canLossless = false;
+    let losslessCheck = "flac_test_failed";
+    let losslessError = null;
+
+    try {
+      const testTrackData = await getTrackTokens(arl, {
+        sid,
+        apiToken,
+        licenseToken,
+      }, "819736552");
+
+      if (!testTrackData?.TRACK_TOKEN) {
+        throw new Error("Could not obtain TRACK_TOKEN for lossless test track");
+      }
+
+      const flacResult = await resolveMediaStream(
+        licenseToken,
+        testTrackData.TRACK_TOKEN,
+        "FLAC"
+      );
+
+      const returnedFormat = String(flacResult?.format || "").toUpperCase();
+      canLossless = returnedFormat === "FLAC" && Boolean(flacResult?.directCdnUrl);
+      losslessCheck = canLossless ? "flac_authorized" : "flac_not_authorized";
+
+      if (!canLossless) {
+        losslessError = `Deezer returned ${returnedFormat || "no format"} instead of FLAC`;
+      }
+    } catch (error) {
+      losslessError = error?.message || "FLAC authorization test failed";
+    }
+
+    return {
+      slot,
+      variable: variableName,
+      status: "active",
+      latency_ms: Date.now() - started,
+      can_lossless: canLossless,
+      lossless_check: losslessCheck,
+      lossless_test_track: "819736552",
+      user_id: user?.USER_ID ?? user?.id ?? null,
+      error: losslessError,
+    };
+  } catch (error) {
+    return {
+      slot,
+      variable: variableName,
+      status: "failed",
+      latency_ms: Date.now() - started,
+      can_lossless: null,
+      lossless_check: "not_tested",
+      error: error?.message || "Authentication request failed",
+    };
+  }
+}
+
+async function pingAllArls(env) {
+  const configured = getConfiguredArls(env);
+
+  if (!configured.length) {
+    return {
+      configured: 0,
+      active: 0,
+      expired_or_invalid: 0,
+      failed: 0,
+      checked_at: new Date().toISOString(),
+      results: [],
+      error: "No DEEZER_ARL environment variables are configured.",
+    };
+  }
+
+  const results = await Promise.all(
+    configured.map(item => pingArlDirect(item.value, item.slot, item.name))
+  );
+
+  const active = results.filter(r => r.status === "active").length;
+  const expired = results.filter(r => r.status === "expired_or_invalid").length;
+  const failed = results.filter(r => r.status === "failed").length;
+
+  return {
+    configured: configured.length,
+    active,
+    expired_or_invalid: expired,
+    failed,
+    checked_at: new Date().toISOString(),
+    results,
+  };
+}
+
+// -------------------------------------------------------------------------
+// PUBLIC CATALOG API HELPERS
+// -------------------------------------------------------------------------
+
+const PUBLIC_API_BASE = "https://api.deezer.com";
+const API_VERSION = "3.0-deezer-hifi";
+
+function clampInt(value, fallback, min, max) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function catalogHeaders() {
+  return {
+    "User-Agent": BROWSER_HEADERS["User-Agent"],
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+}
+
+async function publicApi(path, params = {}, timeoutMs = 8000) {
+  const url = new URL(`${PUBLIC_API_BASE}/${String(path).replace(/^\//, "")}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  }
+
+  let lastError = null;
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url.toString(), {
+        headers: catalogHeaders(),
+        signal: controller.signal,
+      });
+      const result = await readResponse(response);
+
+      if (result.ok && !result.json?.error) return result.json;
+
+      const apiError = result.json?.error;
+      const message = apiError?.message || `Deezer catalog request failed (${result.status})`;
+      const error = new Error(message);
+      error.status = result.status || 502;
+      error.apiError = apiError || null;
+      lastError = error;
+
+      const retryable = result.status === 429 || result.status >= 500;
+      if (!retryable || attempt === maxAttempts) throw error;
+    } catch (error) {
+      lastError = error;
+      const retryable = error?.name === "AbortError" || !error?.status || error.status === 429 || error.status >= 500;
+      if (!retryable || attempt === maxAttempts) throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 150 * (2 ** (attempt - 1))));
+  }
+
+  throw lastError || new Error("Deezer catalog request failed");
+}
+
+function catalogResponse(data, status = 200, maxAge = 60) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
       ...corsHeaders,
       "Content-Type": "application/json; charset=utf-8",
-      ...extraHeaders,
+      "Cache-Control": `public, max-age=${Math.max(0, maxAge)}, stale-while-revalidate=300`,
+      "X-Voria-API-Version": API_VERSION,
     },
   });
 }
 
-function apiError(message, status = 400, extra = {}) {
-  return jsonResponse(
-    {
-      error: message,
-      status,
-      provider: "qobuz",
-      ...extra,
-    },
-    status
-  );
+function apiErrorResponse(message, status = 400, details = null) {
+  return catalogResponse({
+    error: message,
+    status,
+    ...(details ? { details } : {}),
+    api: API_VERSION,
+  }, status, 0);
 }
 
-function headResponse(response) {
-  return new Response(null, {
-    status: response.status,
-    headers: response.headers,
-  });
-}
-
-function normalizePath(pathname) {
-  return pathname.replace(/\/+$/, "") || "/";
-}
-
-function clamp(value, min, max) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return min;
-  return Math.min(max, Math.max(min, Math.floor(n)));
-}
-
-function getLimitOffset(url) {
+function normalizeLimitOffset(url, defaultLimit = 25, maxLimit = 100) {
   return {
-    limit: clamp(url.searchParams.get("limit") || DEFAULT_LIMIT, 1, MAX_LIMIT),
-    offset: Math.max(0, Number(url.searchParams.get("offset") || url.searchParams.get("index") || 0) || 0),
+    limit: clampInt(url.searchParams.get("limit"), defaultLimit, 1, maxLimit),
+    offset: clampInt(url.searchParams.get("offset") ?? url.searchParams.get("index"), 0, 0, 1000000),
   };
 }
 
-function normalizeIsrc(value) {
-  return String(value || "").trim().toUpperCase();
-}
-
-function cleanString(value) {
-  if (value == null) return null;
-  const s = String(value).trim();
-  return s || null;
-}
-
-function numberOrNull(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function boolOrNull(value) {
-  if (value == null) return null;
-  return Boolean(value);
-}
-
-function memorySet(map, key, value, maxSize) {
-  if (map.has(key)) map.delete(key);
-  while (map.size >= maxSize) {
-    map.delete(map.keys().next().value);
-  }
-  map.set(key, value);
-  return value;
-}
-
-function memoryGet(map, key, ttl) {
-  const item = map.get(key);
-  if (!item) return null;
-  if (Date.now() - item.savedAt > ttl) {
-    map.delete(key);
-    return null;
-  }
-  return item.value;
-}
-
-/* =========================================================
- * MD5
- * ========================================================= */
-
-function safeAdd(x, y) {
-  const lsw = (x & 0xffff) + (y & 0xffff);
-  const msw = (x >>> 16) + (y >>> 16) + (lsw >>> 16);
-  return (msw << 16) | (lsw & 0xffff);
-}
-
-function bitRotateLeft(num, cnt) {
-  return (num << cnt) | (num >>> (32 - cnt));
-}
-
-function md5cmn(q, a, b, x, s, t) {
-  return safeAdd(bitRotateLeft(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b);
-}
-
-function md5ff(a, b, c, d, x, s, t) {
-  return md5cmn((b & c) | (~b & d), a, b, x, s, t);
-}
-
-function md5gg(a, b, c, d, x, s, t) {
-  return md5cmn((b & d) | (c & ~d), a, b, x, s, t);
-}
-
-function md5hh(a, b, c, d, x, s, t) {
-  return md5cmn(b ^ c ^ d, a, b, x, s, t);
-}
-
-function md5ii(a, b, c, d, x, s, t) {
-  return md5cmn(c ^ (b | ~d), a, b, x, s, t);
-}
-
-function utf8Bytes(str) {
-  const bytes = [];
-  for (let i = 0; i < str.length; i++) {
-    const code = str.charCodeAt(i);
-    if (code < 0x80) bytes.push(code);
-    else if (code < 0x800) {
-      bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
-    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
-      const next = str.charCodeAt(++i);
-      const cp = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
-      bytes.push(
-        0xf0 | (cp >> 18),
-        0x80 | ((cp >> 12) & 0x3f),
-        0x80 | ((cp >> 6) & 0x3f),
-        0x80 | (cp & 0x3f)
-      );
-    } else {
-      bytes.push(
-        0xe0 | (code >> 12),
-        0x80 | ((code >> 6) & 0x3f),
-        0x80 | (code & 0x3f)
-      );
-    }
-  }
-  return bytes;
-}
-
-function md5(input) {
-  const bytes = utf8Bytes(String(input));
-  const originalLength = bytes.length;
-
-  bytes.push(0x80);
-  while (bytes.length % 64 !== 56) bytes.push(0);
-
-  const bitLengthLow = (originalLength * 8) >>> 0;
-  const bitLengthHigh = Math.floor(originalLength / 0x20000000) >>> 0;
-
-  bytes.push(
-    bitLengthLow & 0xff,
-    (bitLengthLow >>> 8) & 0xff,
-    (bitLengthLow >>> 16) & 0xff,
-    (bitLengthLow >>> 24) & 0xff,
-    bitLengthHigh & 0xff,
-    (bitLengthHigh >>> 8) & 0xff,
-    (bitLengthHigh >>> 16) & 0xff,
-    (bitLengthHigh >>> 24) & 0xff
-  );
-
-  let a = 0x67452301;
-  let b = 0xefcdab89;
-  let c = 0x98badcfe;
-  let d = 0x10325476;
-
-  for (let offset = 0; offset < bytes.length; offset += 64) {
-    const oldA = a;
-    const oldB = b;
-    const oldC = c;
-    const oldD = d;
-
-    const x = new Array(16);
-    for (let i = 0; i < 16; i++) {
-      const j = offset + i * 4;
-      x[i] =
-        (bytes[j] |
-          (bytes[j + 1] << 8) |
-          (bytes[j + 2] << 16) |
-          (bytes[j + 3] << 24)) |
-        0;
-    }
-
-    a = md5ff(a, b, c, d, x[0], 7, -680876936);
-    d = md5ff(d, a, b, c, x[1], 12, -389564586);
-    c = md5ff(c, d, a, b, x[2], 17, 606105819);
-    b = md5ff(b, c, d, a, x[3], 22, -1044525330);
-    a = md5ff(a, b, c, d, x[4], 7, -176418897);
-    d = md5ff(d, a, b, c, x[5], 12, 1200080426);
-    c = md5ff(c, d, a, b, x[6], 17, -1473231341);
-    b = md5ff(b, c, d, a, x[7], 22, -45705983);
-    a = md5ff(a, b, c, d, x[8], 7, 1770035416);
-    d = md5ff(d, a, b, c, x[9], 12, -1958414417);
-    c = md5ff(c, d, a, b, x[10], 17, -42063);
-    b = md5ff(b, c, d, a, x[11], 22, -1990404162);
-    a = md5ff(a, b, c, d, x[12], 7, 1804603682);
-    d = md5ff(d, a, b, c, x[13], 12, -40341101);
-    c = md5ff(c, d, a, b, x[14], 17, -1502002290);
-    b = md5ff(b, c, d, a, x[15], 22, 1236535329);
-
-    a = md5gg(a, b, c, d, x[1], 5, -165796510);
-    d = md5gg(d, a, b, c, x[6], 9, -1069501632);
-    c = md5gg(c, d, a, b, x[11], 14, 643717713);
-    b = md5gg(b, c, d, a, x[0], 20, -373897302);
-    a = md5gg(a, b, c, d, x[5], 5, -701558691);
-    d = md5gg(d, a, b, c, x[10], 9, 38016083);
-    c = md5gg(c, d, a, b, x[15], 14, -660478335);
-    b = md5gg(b, c, d, a, x[4], 20, -405537848);
-    a = md5gg(a, b, c, d, x[9], 5, 568446438);
-    d = md5gg(d, a, b, c, x[14], 9, -1019803690);
-    c = md5gg(c, d, a, b, x[3], 14, -187363961);
-    b = md5gg(b, c, d, a, x[8], 20, 1163531501);
-    a = md5gg(a, b, c, d, x[13], 5, -1444681467);
-    d = md5gg(d, a, b, c, x[2], 9, -51403784);
-    c = md5gg(c, d, a, b, x[7], 14, 1735328473);
-    b = md5gg(b, c, d, a, x[12], 20, -1926607734);
-
-    a = md5hh(a, b, c, d, x[5], 4, -378558);
-    d = md5hh(d, a, b, c, x[8], 11, -2022574463);
-    c = md5hh(c, d, a, b, x[11], 16, 1839030562);
-    b = md5hh(b, c, d, a, x[14], 23, -35309556);
-    a = md5hh(a, b, c, d, x[1], 4, -1530992060);
-    d = md5hh(d, a, b, c, x[4], 11, 1272893353);
-    c = md5hh(c, d, a, b, x[7], 16, -155497632);
-    b = md5hh(b, c, d, a, x[10], 23, -1094730640);
-    a = md5hh(a, b, c, d, x[13], 4, 681279174);
-    d = md5hh(d, a, b, c, x[0], 11, -358537222);
-    c = md5hh(c, d, a, b, x[3], 16, -722521979);
-    b = md5hh(b, c, d, a, x[6], 23, 76029189);
-    a = md5hh(a, b, c, d, x[9], 4, -640364487);
-    d = md5hh(d, a, b, c, x[12], 11, -421815835);
-    c = md5hh(c, d, a, b, x[15], 16, 530742520);
-    b = md5hh(b, c, d, a, x[2], 23, -995338651);
-
-    a = md5ii(a, b, c, d, x[0], 6, -198630844);
-    d = md5ii(d, a, b, c, x[7], 10, 1126891415);
-    c = md5ii(c, d, a, b, x[14], 15, -1416354905);
-    b = md5ii(b, c, d, a, x[5], 21, -57434055);
-    a = md5ii(a, b, c, d, x[12], 6, 1700485571);
-    d = md5ii(d, a, b, c, x[3], 10, -1894986606);
-    c = md5ii(c, d, a, b, x[10], 15, -1051523);
-    b = md5ii(b, c, d, a, x[1], 21, -2054922799);
-    a = md5ii(a, b, c, d, x[8], 6, 1873313359);
-    d = md5ii(d, a, b, c, x[15], 10, -30611744);
-    c = md5ii(c, d, a, b, x[6], 15, -1560198380);
-    b = md5ii(b, c, d, a, x[13], 21, 1309151649);
-    a = md5ii(a, b, c, d, x[4], 6, -145523070);
-    d = md5ii(d, a, b, c, x[11], 10, -1120210379);
-    c = md5ii(c, d, a, b, x[2], 15, 718787259);
-    b = md5ii(b, c, d, a, x[9], 21, -343485551);
-
-    a = safeAdd(a, oldA);
-    b = safeAdd(b, oldB);
-    c = safeAdd(c, oldC);
-    d = safeAdd(d, oldD);
-  }
-
-  const words = [a, b, c, d];
-  let output = "";
-  for (const word of words) {
-    for (let j = 0; j < 4; j++) {
-      output += ((word >>> (j * 8)) & 0xff).toString(16).padStart(2, "0");
-    }
-  }
-  return output;
-}
-
-/* =========================================================
- * HTTP helpers
- * ========================================================= */
-
-async function readResponse(response) {
-  const contentType = response.headers.get("content-type") || "";
-  let json = null;
-  let text = "";
-
-  if (contentType.includes("json")) {
-    try {
-      json = await response.json();
-    } catch (_) {}
-  } else {
-    try {
-      text = await response.text();
-      json = JSON.parse(text);
-    } catch (_) {}
-  }
-
+function normalizeTrack(track) {
+  if (!track) return null;
+  const artwork = buildArtworkUrls(track.album?.cover_xl || track.album?.cover, "cover");
+  const artistArtwork = buildArtworkUrls(track.artist?.picture_xl || track.artist?.picture, "artist");
   return {
-    status: response.status,
-    ok: response.ok,
-    headers: response.headers,
-    json,
-    text,
+    id: track.id ?? null,
+    title: track.title ?? null,
+    title_short: track.title_short ?? null,
+    version: track.version ?? null,
+    duration: toNumber(track.duration),
+    rank: toNumber(track.rank),
+    explicit: Boolean(track.explicit_lyrics),
+    explicit_content_lyrics: track.explicit_content_lyrics ?? null,
+    explicit_content_cover: track.explicit_content_cover ?? null,
+    preview: track.preview ?? null,
+    bpm: toNumber(track.bpm),
+    gain: toNumber(track.gain),
+    isrc: track.isrc ?? null,
+    readable: track.readable ?? null,
+    link: track.link ?? null,
+    artist: track.artist ? {
+      id: track.artist.id ?? null,
+      name: track.artist.name ?? null,
+      link: track.artist.link ?? null,
+      artwork: artistArtwork,
+    } : null,
+    album: track.album ? {
+      id: track.album.id ?? null,
+      title: track.album.title ?? null,
+      link: track.album.link ?? null,
+      release_date: track.album.release_date ?? null,
+      artwork,
+    } : null,
+    artwork,
   };
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function isTransientStatus(status) {
-  return status === 408 || status === 425 || status === 429 || status >= 500;
-}
-
-async function qobuzRequest(path, {
-  token,
-  appId,
-  method = "GET",
-  query = {},
-  headers = {},
-  body,
-  timeoutMs = 8000,
-  retries = 2,
-} = {}) {
-  const url = new URL(`${QOBUZ_BASE}/${String(path).replace(/^\/+/, "")}`);
-
-  // Qobuz requires app_id on the API request URL for signed playback
-  // endpoints. Keep it OUT of request_sig generation, because the signing
-  // algorithm signs the endpoint parameters, not app_id itself.
-  const finalQuery = { ...query };
-  if (appId && finalQuery.app_id === undefined) {
-    finalQuery.app_id = appId;
-  }
-
-  for (const [key, value] of Object.entries(finalQuery)) {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  }
-
-  const requestHeaders = {
-    Accept: "application/json",
-    "User-Agent": "Qobuz-HiFi-API/2.0",
-    ...headers,
-  };
-
-  if (appId) requestHeaders["X-App-Id"] = appId;
-  if (token) {
-    requestHeaders["X-User-Auth-Token"] = token;
-    requestHeaders.Authorization = `Bearer ${token}`;
-  }
-
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const response = await fetchWithTimeout(
-        url,
-        {
-          method,
-          headers: requestHeaders,
-          body,
-        },
-        timeoutMs
-      );
-
-      if (!isTransientStatus(response.status) || attempt === retries) {
-        return response;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 150 * 2 ** attempt));
-    } catch (error) {
-      lastError = error;
-      if (attempt === retries) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 150 * 2 ** attempt));
-    }
-  }
-
-  throw lastError || new Error("Qobuz request failed");
-}
-
-/* =========================================================
- * Token pool
- * ========================================================= */
-
-function credentialKey(prefix, slot) {
-  return slot === 1 ? prefix : `${prefix}_${slot}`;
-}
-
-function getCredentials(env, slot) {
-  const appId =
-    cleanString(env[credentialKey("QOBUZ_APP_ID", slot)]) ||
-    (slot !== 1 ? cleanString(env.QOBUZ_APP_ID) : "");
-
-  const appSecret =
-    cleanString(env[credentialKey("QOBUZ_APP_SECRET", slot)]) ||
-    (slot !== 1 ? cleanString(env.QOBUZ_APP_SECRET) : "");
-
+function normalizeAlbum(album) {
+  if (!album) return null;
+  const artwork = buildArtworkUrls(album.cover_xl || album.cover, "cover");
   return {
-    appId,
-    appSecret,
-    credential_source:
-      cleanString(env[credentialKey("QOBUZ_APP_ID", slot)]) &&
-      cleanString(env[credentialKey("QOBUZ_APP_SECRET", slot)])
-        ? "slot"
-        : "default_fallback",
-  };
-}
-
-function getCredentialPairs(env) {
-  const pairs = [];
-  const seen = new Set();
-
-  for (let i = 1; i <= MAX_TOKENS; i++) {
-    const credentials = getCredentials(env, i);
-    if (!credentials.appId || !credentials.appSecret) continue;
-
-    const key = `${credentials.appId}|${credentials.appSecret}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    pairs.push({
-      credential_slot: i,
-      appId: credentials.appId,
-      appSecret: credentials.appSecret,
-      credential_source: credentials.credential_source,
-    });
-  }
-
-  return pairs;
-}
-
-function getTokens(env) {
-  const tokens = [];
-  const credentialPairs = getCredentialPairs(env);
-
-  for (let i = 1; i <= MAX_TOKENS; i++) {
-    const key = credentialKey("QOBUZ_USER_AUTH_TOKEN", i);
-    const token = cleanString(env[key]);
-    if (!token) continue;
-
-    const credentials = getCredentials(env, i);
-    const ownKey = credentials.appId && credentials.appSecret
-      ? `${credentials.appId}|${credentials.appSecret}`
-      : null;
-
-    const candidates = credentialPairs
-      .slice()
-      .sort((a, b) => {
-        const aOwn = `${a.appId}|${a.appSecret}` === ownKey ? 0 : 1;
-        const bOwn = `${b.appId}|${b.appSecret}` === ownKey ? 0 : 1;
-        return aOwn - bOwn || a.credential_slot - b.credential_slot;
-      });
-
-    tokens.push({
-      slot: i,
-      token,
-      appId: credentials.appId,
-      appSecret: credentials.appSecret,
-      credential_source: credentials.credential_source,
-      credential_candidates: candidates,
-    });
-  }
-
-  return tokens;
-}
-
-function tokenKey(slot) {
-  return `qobuz:${slot}`;
-}
-
-function getTokenState(slot) {
-  const key = tokenKey(slot);
-  if (!tokenState.has(key)) {
-    tokenState.set(key, {
-      failures: 0,
-      lastFailure: 0,
-      lastSuccess: 0,
-      lastStatus: null,
-      lastError: null,
-    });
-  }
-  return tokenState.get(key);
-}
-
-function tokenAvailable(slot) {
-  const state = getTokenState(slot);
-  return Date.now() - state.lastFailure >= TOKEN_COOLDOWN_MS;
-}
-
-function markTokenSuccess(slot) {
-  const state = getTokenState(slot);
-  state.failures = 0;
-  state.lastSuccess = Date.now();
-  state.lastStatus = 200;
-  state.lastError = null;
-}
-
-function markTokenFailure(slot, status, error) {
-  const state = getTokenState(slot);
-  state.failures++;
-  state.lastFailure = Date.now();
-  state.lastStatus = status ?? null;
-  state.lastError = error ? String(error).slice(0, 300) : null;
-}
-
-function orderedTokens(env, preferredSlot = null) {
-  const tokens = getTokens(env);
-  if (!tokens.length) return [];
-
-  const preferred = preferredSlot
-    ? tokens.find((x) => x.slot === Number(preferredSlot))
-    : null;
-
-  const rest = tokens.filter((x) => !preferred || x.slot !== preferred.slot);
-
-  rest.sort((a, b) => {
-    const aa = getTokenState(a.slot);
-    const bb = getTokenState(b.slot);
-
-    const aAvailable = tokenAvailable(a.slot) ? 0 : 1;
-    const bAvailable = tokenAvailable(b.slot) ? 0 : 1;
-    if (aAvailable !== bAvailable) return aAvailable - bAvailable;
-
-    if (aa.lastSuccess !== bb.lastSuccess) {
-      return bb.lastSuccess - aa.lastSuccess;
-    }
-
-    return a.slot - b.slot;
-  });
-
-  return preferred ? [preferred, ...rest] : rest;
-}
-
-async function withTokenFailover(env, operation, preferredSlot = null) {
-  const tokens = orderedTokens(env, preferredSlot);
-  if (!tokens.length) {
-    throw Object.assign(new Error("No Qobuz auth tokens configured"), { status: 500 });
-  }
-
-  const errors = [];
-
-  for (const entry of tokens) {
-    if (!entry.appId || !entry.appSecret) {
-      markTokenFailure(entry.slot, 500, "Missing App ID or App Secret for this token slot");
-      errors.push({
-        slot: entry.slot,
-        status: 500,
-        error: "Missing Qobuz App ID or App Secret for this token slot",
-      });
-      continue;
-    }
-
-    if (!tokenAvailable(entry.slot) && tokens.length > 1) continue;
-
-    try {
-      const result = await operation({
-        token: entry.token,
-        slot: entry.slot,
-        appId: entry.appId,
-        appSecret: entry.appSecret,
-        credential_source: entry.credential_source,
-      });
-
-      if (result?.response?.status === 401 || result?.response?.status === 403) {
-        const message =
-          result.response.headers.get("www-authenticate") ||
-          `HTTP ${result.response.status}`;
-        markTokenFailure(entry.slot, result.response.status, message);
-        errors.push({ slot: entry.slot, status: result.response.status, error: message });
-        continue;
-      }
-
-      markTokenSuccess(entry.slot);
-      return {
-        ...result,
-        tokenSlot: entry.slot,
-        token: entry.token,
-      };
-    } catch (error) {
-      markTokenFailure(entry.slot, error?.status, error?.message);
-      errors.push({
-        slot: entry.slot,
-        status: error?.status || null,
-        error: error?.message || String(error),
-      });
-    }
-  }
-
-  throw Object.assign(new Error("All configured Qobuz tokens failed"), {
-    status: 502,
-    tokenErrors: errors,
-  });
-}
-
-/* =========================================================
- * Artwork / normalization
- * ========================================================= */
-
-function normalizeImageUrl(value, size = null) {
-  if (!value) return null;
-  let url = String(value);
-
-  if (size && /_(small|medium|large|extralarge|max)\.(jpg|jpeg|png)$/i.test(url)) {
-    url = url.replace(/_(small|medium|large|extralarge|max)(\.[a-z]+)$/i, `_${size}$2`);
-  }
-
-  if (size && /\/(small|medium|large)\//i.test(url)) {
-    url = url.replace(/\/(small|medium|large)\//i, `/${size}/`);
-  }
-
-  return url;
-}
-
-function artworkSet(image) {
-  if (!image) {
-    return {
-      small: null,
-      medium: null,
-      large: null,
-      extraLarge: null,
-      max: null,
-    };
-  }
-
-  if (typeof image === "string") {
-    return {
-      small: normalizeImageUrl(image, "small"),
-      medium: normalizeImageUrl(image, "medium"),
-      large: normalizeImageUrl(image, "large"),
-      extraLarge: normalizeImageUrl(image, "extralarge"),
-      max: normalizeImageUrl(image, "max"),
-    };
-  }
-
-  const source =
-    image.original ||
-    image.max ||
-    image.large ||
-    image.medium ||
-    image.small ||
-    image;
-
-  return {
-    small: image.small || normalizeImageUrl(source, "small"),
-    medium: image.medium || normalizeImageUrl(source, "medium"),
-    large: image.large || normalizeImageUrl(source, "large"),
-    extraLarge:
-      image.extralarge ||
-      image.extra_large ||
-      normalizeImageUrl(source, "extralarge"),
-    max: image.max || normalizeImageUrl(source, "max"),
+    id: album.id ?? null,
+    title: album.title ?? null,
+    upc: album.upc ?? null,
+    link: album.link ?? null,
+    release_date: album.release_date ?? null,
+    record_type: album.record_type ?? null,
+    genre_id: album.genre_id ?? null,
+    nb_tracks: toNumber(album.nb_tracks),
+    duration: toNumber(album.duration),
+    fans: toNumber(album.fans),
+    rating: toNumber(album.rating),
+    explicit_lyrics: album.explicit_lyrics ?? null,
+    label: album.label ?? null,
+    available: album.available ?? null,
+    artwork,
+    artist: album.artist ? {
+      id: album.artist.id ?? null,
+      name: album.artist.name ?? null,
+      link: album.artist.link ?? null,
+      artwork: buildArtworkUrls(album.artist.picture_xl || album.artist.picture, "artist"),
+    } : null,
   };
 }
 
@@ -731,2161 +1355,765 @@ function normalizeArtist(artist) {
   return {
     id: artist.id ?? null,
     name: artist.name ?? null,
-    slug: artist.slug ?? null,
-    picture: artworkSet(artist.image || artist.picture || artist.picture_url),
-    albums_count: numberOrNull(
-      artist.albums_count ?? artist.albums_count_total ?? artist.nb_album
-    ),
-    biography: artist.biography ?? artist.bio ?? null,
-    link: artist.url ?? artist.link ?? null,
-  };
-}
-
-function normalizeAlbum(album) {
-  if (!album) return null;
-
-  return {
-    id: album.id ?? null,
-    title: album.title ?? null,
-    subtitle: album.subtitle ?? null,
-    version: album.version ?? null,
-    artist: normalizeArtist(album.artist),
-    artists: Array.isArray(album.artists)
-      ? album.artists.map(normalizeArtist).filter(Boolean)
-      : [],
-    image: artworkSet(album.image || album.images),
-    release_date:
-      album.release_date_original ||
-      album.release_date ||
-      album.released_at ||
-      null,
-    genre: album.genre ?? null,
-    genres: Array.isArray(album.genres) ? album.genres : [],
-    tracks_count:
-      numberOrNull(album.tracks_count) ??
-      numberOrNull(album.tracks?.total) ??
-      null,
-    duration: numberOrNull(album.duration),
-    hires: Boolean(
-      album.hires ||
-      album.hires_streamable ||
-      album.maximum_bit_depth >= 24 ||
-      album.maximum_sampling_rate > 44100
-    ),
-    maximum_bit_depth: numberOrNull(album.maximum_bit_depth),
-    maximum_sampling_rate: numberOrNull(album.maximum_sampling_rate),
-    maximum_channel_count: numberOrNull(album.maximum_channel_count),
-    streamable: album.streamable ?? null,
-    purchasable: album.purchasable ?? null,
-    url: album.url ?? album.link ?? null,
-  };
-}
-
-function normalizeTrack(track) {
-  if (!track) return null;
-
-  const album = track.album || null;
-  const performer = track.performer || track.artist || null;
-
-  return {
-    id: track.id ?? null,
-    title: track.title ?? null,
-    version: track.version ?? null,
-    subtitle: track.subtitle ?? null,
-    isrc: track.isrc ?? null,
-    artist: normalizeArtist(performer),
-    artists: Array.isArray(track.artists)
-      ? track.artists.map(normalizeArtist).filter(Boolean)
-      : performer
-        ? [normalizeArtist(performer)]
-        : [],
-    album: normalizeAlbum(album),
-    image: artworkSet(
-      track.image ||
-      album?.image ||
-      album?.images
-    ),
-    duration: numberOrNull(track.duration),
-    track_number: numberOrNull(track.track_number),
-    media_number: numberOrNull(track.media_number),
-    copyright: track.copyright ?? null,
-    label: track.label ?? null,
-    genre: track.genre ?? null,
-    genres: Array.isArray(track.genres) ? track.genres : [],
-    release_date:
-      track.release_date_original ||
-      track.release_date ||
-      album?.release_date_original ||
-      album?.release_date ||
-      null,
-    maximum_bit_depth: numberOrNull(track.maximum_bit_depth),
-    maximum_sampling_rate: numberOrNull(track.maximum_sampling_rate),
-    maximum_channel_count: numberOrNull(track.maximum_channel_count),
-    hires: Boolean(
-      track.hires ||
-      track.maximum_bit_depth >= 24 ||
-      track.maximum_sampling_rate > 44100
-    ),
-    streamable: track.streamable ?? null,
-    purchasable: track.purchasable ?? null,
-    url: track.url ?? track.link ?? null,
+    link: artist.link ?? null,
+    nb_album: toNumber(artist.nb_album),
+    nb_fan: toNumber(artist.nb_fan),
+    radio: artist.radio ?? null,
+    tracklist: artist.tracklist ?? null,
+    artwork: buildArtworkUrls(artist.picture_xl || artist.picture, "artist"),
   };
 }
 
 function normalizePlaylist(playlist) {
   if (!playlist) return null;
-
   return {
     id: playlist.id ?? null,
-    name: playlist.name ?? playlist.title ?? null,
-    title: playlist.title ?? playlist.name ?? null,
+    title: playlist.title ?? null,
     description: playlist.description ?? null,
-    image: artworkSet(playlist.image || playlist.images),
-    tracks_count:
-      numberOrNull(playlist.tracks_count) ??
-      numberOrNull(playlist.tracks?.total) ??
-      null,
-    duration: numberOrNull(playlist.duration),
-    owner: normalizeArtist(playlist.owner || playlist.creator),
-    is_public: playlist.is_public ?? playlist.public ?? null,
-    url: playlist.url ?? playlist.link ?? null,
+    public: playlist.public ?? null,
+    is_loved_track: playlist.is_loved_track ?? null,
+    nb_tracks: toNumber(playlist.nb_tracks),
+    fans: toNumber(playlist.fans),
+    duration: toNumber(playlist.duration),
+    link: playlist.link ?? null,
+    creation_date: playlist.creation_date ?? null,
+    modification_date: playlist.modification_date ?? null,
+    picture: buildArtworkUrls(playlist.picture_xl || playlist.picture, "cover"),
+    creator: playlist.creator ? {
+      id: playlist.creator.id ?? null,
+      name: playlist.creator.name ?? null,
+    } : null,
   };
 }
 
-function normalizeCollection(payload, key, normalizer) {
-  const collection = payload?.[key] || payload;
-  const items = Array.isArray(collection?.items)
-    ? collection.items.map(normalizer).filter(Boolean)
-    : Array.isArray(collection)
-      ? collection.map(normalizer).filter(Boolean)
-      : [];
-
+function normalizeCollection(result, normalizer) {
+  const items = Array.isArray(result?.data) ? result.data.map(normalizer).filter(Boolean) : [];
   return {
     data: items,
-    total:
-      numberOrNull(collection?.total) ??
-      numberOrNull(payload?.total) ??
-      items.length,
-    offset:
-      numberOrNull(collection?.offset) ??
-      numberOrNull(payload?.offset) ??
-      0,
-    limit:
-      numberOrNull(collection?.limit) ??
-      numberOrNull(payload?.limit) ??
-      items.length,
-    next: collection?.next ?? payload?.next ?? null,
-    previous:
-      collection?.previous ??
-      collection?.prev ??
-      payload?.previous ??
-      payload?.prev ??
-      null,
+    total: toNumber(result?.total),
+    next: result?.next ?? null,
+    previous: result?.prev ?? result?.previous ?? null,
   };
 }
 
-/* =========================================================
- * Metadata cache
- * ========================================================= */
+async function handleCatalogRoute(requestUrl) {
+  const path = requestUrl.pathname.replace(/\/+$/, "") || "/";
+  const { limit, offset } = normalizeLimitOffset(requestUrl);
 
-function cacheKey(type, id) {
-  return `qobuz:${type}:${String(id)}`;
-}
-
-function cacheMemoryTrack(key, value) {
-  memorySet(
-    memoryTrackCache,
-    key,
-    { savedAt: Date.now(), value },
-    MAX_MEMORY_TRACK_CACHE
-  );
-}
-
-function getMemoryTrack(key) {
-  return memoryGet(memoryTrackCache, key, MEMORY_TRACK_CACHE_TTL);
-}
-
-function sharedMetadataKey(key) {
-  return `${GENERAL_CACHE_PREFIX}${key}`;
-}
-
-function saveMetadata(env, ctx, key, value, ttlSeconds = 2592000) {
-  if (!env.GENERAL_MUSIC_CACHE) return;
-
-  const task = env.GENERAL_MUSIC_CACHE
-    .put(
-      sharedMetadataKey(key),
-      JSON.stringify(value),
-      { expirationTtl: Math.max(60, Math.floor(ttlSeconds)) }
-    )
-    .catch(() => {});
-
-  if (ctx?.waitUntil) ctx.waitUntil(task);
-}
-
-async function getCachedMetadata(env, key) {
-  if (!env.GENERAL_MUSIC_CACHE) return null;
-
-  try {
-    return await env.GENERAL_MUSIC_CACHE.get(sharedMetadataKey(key), { type: "json" });
-  } catch (_) {
-    return null;
-  }
-}
-
-/* =========================================================
- * Search / catalog
- * ========================================================= */
-
-async function catalogRequest(env, path, query, preferredSlot = null) {
-  return withTokenFailover(
-    env,
-    async ({ token, appId, slot }) => {
-      const requestQuery = { ...(query || {}) };
-
-      // App credentials are slot-specific. Never leak the global App ID
-      // into a request when a different token slot is being used.
-      requestQuery.app_id = appId;
-
-      const response = await qobuzRequest(path, {
-        token,
-        appId,
-        query: requestQuery,
-      });
-
-      return {
-        response,
-        slot,
-        token,
-      };
-    },
-    preferredSlot
-  );
-}
-
-async function catalogJson(env, path, query, preferredSlot = null) {
-  const result = await catalogRequest(env, path, query, preferredSlot);
-  const parsed = await readResponse(result.response);
-
-  if (!parsed.ok || !parsed.json) {
-    const error = new Error(
-      parsed.json?.message ||
-      parsed.json?.error ||
-      parsed.text ||
-      `Qobuz API returned HTTP ${parsed.status}`
-    );
-    error.status = parsed.status;
-    error.api = parsed.json;
-    error.tokenSlot = result.tokenSlot;
-    throw error;
-  }
-
-  return {
-    json: parsed.json,
-    tokenSlot: result.tokenSlot,
-    response: result.response,
-  };
-}
-
-async function searchCatalog(env, url) {
-  const isrc =
-    cleanString(url.searchParams.get("i")) ||
-    cleanString(url.searchParams.get("isrc"));
-
-  const q =
-    cleanString(url.searchParams.get("q")) ||
-    cleanString(url.searchParams.get("query")) ||
-    cleanString(url.searchParams.get("s")) ||
-    cleanString(url.searchParams.get("a")) ||
-    cleanString(url.searchParams.get("al")) ||
-    cleanString(url.searchParams.get("p"));
-
-  const { limit, offset } = getLimitOffset(url);
-  let type = cleanString(url.searchParams.get("type"));
-
-  if (!type) {
-    if (url.searchParams.has("a")) type = "artist";
-    else if (url.searchParams.has("al")) type = "album";
-    else if (url.searchParams.has("p")) type = "playlist";
-    else type = "track";
-  }
-
-  if (isrc) {
-    const found = await findTrackByIsrc(env, isrc, null, null);
-    const item = found?.track ? normalizeTrack(found.track) : null;
-    return {
+  if (path === "/" || path === "/info-api") {
+    return catalogResponse({
       version: API_VERSION,
-      provider: "qobuz",
-      type: "track",
-      query: isrc,
-      data: item ? [item] : [],
-      total: item ? 1 : 0,
-      next: null,
-      previous: null,
-      tokenSlot: found?.tokenSlot || null,
-    };
-  }
-
-  if (!q) throw Object.assign(new Error("Missing q/query"), { status: 400 });
-
-  const t = String(type).toLowerCase();
-  const aliases = {
-    track: "tracks", tracks: "tracks", song: "tracks", songs: "tracks",
-    album: "albums", albums: "albums",
-    artist: "artists", artists: "artists",
-    playlist: "playlists", playlists: "playlists",
-    all: "all",
-  };
-  const normalizedType = aliases[t];
-
-  if (!normalizedType) {
-    throw Object.assign(new Error("Invalid type. Use track, album, artist, playlist, or all."), { status: 400 });
-  }
-
-  // These are separate, verified Qobuz catalog methods. `all` uses the
-  // documented catalog/search aggregator. This avoids inventing resource
-  // names such as `catalog/search?type=...` for endpoints that have their own
-  // stable search methods.
-  const requests = {
-    tracks: () => catalogJson(env, "track/search", { query: q, limit, offset }),
-    albums: () => catalogJson(env, "album/search", { query: q, limit, offset }),
-    artists: () => catalogJson(env, "artist/search", { query: q, limit, offset }),
-    playlists: () => catalogJson(env, "playlist/search", { query: q, limit, offset }),
-    all: () => catalogJson(env, "catalog/search", { query: q, limit, offset }),
-  };
-
-  const result = await requests[normalizedType]();
-  const json = result.json || {};
-
-  let data = [];
-  let total = 0;
-
-  if (normalizedType === "tracks") {
-    data = json?.tracks?.items || [];
-    total = numberOrNull(json?.tracks?.total) ?? data.length;
-  } else if (normalizedType === "albums") {
-    data = json?.albums?.items || [];
-    total = numberOrNull(json?.albums?.total) ?? data.length;
-  } else if (normalizedType === "artists") {
-    data = json?.artists?.items || [];
-    total = numberOrNull(json?.artists?.total) ?? data.length;
-  } else if (normalizedType === "playlists") {
-    data = json?.playlists?.items || [];
-    total = numberOrNull(json?.playlists?.total) ?? data.length;
-  } else {
-    data = json?.tracks?.items || [];
-    total = numberOrNull(json?.tracks?.total) ?? data.length;
-  }
-
-  const normalizer = normalizedType === "albums" ? normalizeAlbum
-    : normalizedType === "artists" ? normalizeArtist
-    : normalizedType === "playlists" ? normalizePlaylist
-    : normalizeTrack;
-
-  let normalizedData = data.map(normalizer).filter(Boolean);
-
-  // Track search may optionally enrich each result with a direct legacy
-  // streamUrl. The endpoint is verified and returns a direct URL, unlike the
-  // modern /file/url segmented descriptor. `include_stream=0` skips this
-  // expensive enrichment when a caller only wants catalog search.
-  const includeStream = normalizedType === "tracks" &&
-    url.searchParams.get("include_stream") !== "0";
-
-  if (includeStream) {
-    const searchQuality =
-      cleanString(url.searchParams.get("quality") || url.searchParams.get("format")) || "best";
-
-    const searchTokens = orderedTokens(env, result.tokenSlot || null);
-    const searchToken = searchTokens[0] || null;
-    const searchCredential = searchToken?.credential_candidates?.[0] || null;
-
-    const enrich = async (track, normalized) => {
-      const key = `stream:${String(track.id)}:${String(searchQuality).toLowerCase()}`;
-      const cached = memoryGet(memoryStreamCache, key, STREAM_URL_CACHE_TTL);
-      if (cached?.url) {
-        return applyResolvedPlayback(normalized, cached, "memory");
-      }
-
-      if (!searchToken || !searchCredential) {
-        return { ...normalized, streamUrl: null, playback_error: "No Qobuz playback credentials configured" };
-      }
-
-      const formats = qualityPlan(track, searchQuality);
-      for (const fmt of formats) {
-        try {
-          const legacy = await resolveLegacyFileUrl(env, {
-            trackId: String(track.id),
-            formatId: fmt.id,
-            intent: "stream",
-            token: searchToken.token,
-            appId: searchCredential.appId,
-            appSecret: searchCredential.appSecret,
-          });
-
-          if (!legacy.parsed.ok || !legacy.url) continue;
-
-          const playback = {
-            ...legacy,
-            token_slot: searchToken.slot,
-            credential_slot: searchCredential.credential_slot,
-            credential_source: searchCredential.credential_slot === searchToken.slot
-              ? searchCredential.credential_source
-              : "cross_slot_fallback",
-            format_name: fmt.name,
-            mime_type: legacy.parsed.json?.mime_type || (String(fmt.id) === "5" ? "audio/mpeg" : "audio/flac"),
-            bit_depth: numberOrNull(legacy.parsed.json?.bit_depth) ?? (String(fmt.id) === "5" ? null : String(fmt.id) === "6" ? 16 : 24),
-            sampling_rate: numberOrNull(legacy.parsed.json?.sampling_rate) ?? (String(fmt.id) === "5" ? null : String(fmt.id) === "6" ? 44100 : null),
-            bitrate: numberOrNull(legacy.parsed.json?.bitrate) ?? (String(fmt.id) === "5" ? 320 : null),
-          };
-
-          memorySet(memoryStreamCache, key, playback, MAX_MEMORY_STREAM_CACHE);
-          markTokenSuccess(searchToken.slot);
-          return applyResolvedPlayback(normalized, playback, "miss");
-        } catch (_) {}
-      }
-
-      // If the first catalog-authenticated token cannot resolve a direct URL,
-      // let the normal token/credential failover try the track. This is only
-      // done for failed results, keeping the common search path fast.
-      try {
-        const playback = await resolveDirectLegacyStream(env, {
-          track,
-          trackId: String(track.id),
-          quality: searchQuality,
-          preferredTokenSlot: result.tokenSlot || null,
-        });
-        return applyResolvedPlayback(normalized, playback, "fallback");
-      } catch (error) {
-        return { ...normalized, streamUrl: null, playback_error: error?.message || String(error) };
-      }
-    };
-
-    normalizedData = await Promise.all(
-      data.map((track, index) => enrich(track, normalizedData[index]))
-    );
-  }
-
-  const envelope = {
-    version: API_VERSION,
-    provider: "qobuz",
-    query: q,
-    type: normalizedType,
-    tokenSlot: result.tokenSlot,
-    data: normalizedData,
-    total,
-    offset,
-    limit,
-    next: null,
-    previous: offset > 0 ? Math.max(0, offset - limit) : null,
-  };
-
-  if (normalizedType === "all") {
-    envelope.tracks = normalizeCollection(json?.tracks || {}, "items", normalizeTrack);
-    envelope.albums = normalizeCollection(json?.albums || {}, "items", normalizeAlbum);
-    envelope.artists = normalizeCollection(json?.artists || {}, "items", normalizeArtist);
-    envelope.playlists = normalizeCollection(json?.playlists || {}, "items", normalizePlaylist);
-  }
-
-  return envelope;
-}
-
-function applyResolvedPlayback(normalized, playback, cacheState) {
-  const bitDepth = playback.bit_depth ?? null;
-  const samplingRate = playback.sampling_rate ?? null;
-  return {
-    ...normalized,
-    streamUrl: playback.url || null,
-    stream_type: playback.url ? "direct_url" : null,
-    stream_url_template: null,
-    stream_segments: null,
-    format_id: playback.format_id || null,
-    format: playback.format_name || null,
-    mime_type: playback.mime_type || null,
-    bit_depth: bitDepth,
-    sampling_rate: samplingRate,
-    bitrate: playback.bitrate ?? null,
-    maximum_bit_depth: bitDepth ?? normalized.maximum_bit_depth ?? null,
-    maximum_sampling_rate: samplingRate ?? normalized.maximum_sampling_rate ?? null,
-    hires: bitDepth >= 24 || samplingRate > 44100 ? true : normalized.hires,
-    playback_token_slot: playback.token_slot || null,
-    playback_credential_slot: playback.credential_slot || null,
-    playback_credential_source: playback.credential_source || null,
-    playback_signing_mode: playback.signing_mode || "legacy_track_getFileUrl",
-    stream_cache: cacheState,
-  };
-}
-
-async function findTrackByIsrc(env, isrc, preferredSlot = null, ctx = null) {
-  const normalized = normalizeIsrc(isrc);
-  if (!normalized) return null;
-
-  const memoryKey = cacheKey("isrc", normalized);
-  const memoryHit = getMemoryTrack(memoryKey);
-  if (memoryHit) return { track: memoryHit, source: "memory", tokenSlot: null };
-
-  const pending = pendingLookups.get(normalized);
-  if (pending) {
-    const result = await pending;
-    return { ...result, source: "coalesced" };
-  }
-
-  const lookup = (async () => {
-    const kv = await getCachedMetadata(env, memoryKey);
-    if (kv?.id) {
-      cacheMemoryTrack(memoryKey, kv);
-      return { track: kv, source: "kv", tokenSlot: null };
-    }
-
-    const result = await catalogJson(env, "catalog/search", {
-      query: normalized,
-      limit: 10,
-      offset: 0,
-    }, preferredSlot);
-
-    const tracks = result.json?.tracks?.items || [];
-    const exact =
-      tracks.find((track) => normalizeIsrc(track?.isrc) === normalized) ||
-      null;
-
-    if (!exact) {
-      return {
-        track: null,
-        source: "miss",
-        tokenSlot: result.tokenSlot,
-      };
-    }
-
-    cacheMemoryTrack(memoryKey, exact);
-    saveMetadata(env, ctx, memoryKey, exact, 2592000);
-
-    return {
-      track: exact,
-      source: "miss",
-      tokenSlot: result.tokenSlot,
-    };
-  })();
-
-  pendingLookups.set(normalized, lookup);
-
-  try {
-    return await lookup;
-  } finally {
-    pendingLookups.delete(normalized);
-  }
-}
-
-/* =========================================================
- * Signed stream URL
- * ========================================================= */
-
-function qualityPlan(track, requestedQuality = "best") {
-  const q = String(requestedQuality || "best").toLowerCase();
-
-  if (q === "mp3" || q === "320" || q === "mp3_320") {
-    return [{ id: "5", name: "mp3_320" }];
-  }
-
-  if (q === "cd" || q === "flac" || q === "16" || q === "lossless") {
-    return [{ id: "6", name: "flac_16_44" }, { id: "5", name: "mp3_320" }];
-  }
-
-  if (q === "96" || q === "hires96" || q === "hires_96") {
-    return [
-      { id: "7", name: "flac_24_96" },
-      { id: "6", name: "flac_16_44" },
-      { id: "5", name: "mp3_320" },
-    ];
-  }
-
-  if (q === "192" || q === "hires192" || q === "hires_192") {
-    return [
-      { id: "27", name: "flac_24_192" },
-      { id: "7", name: "flac_24_96" },
-      { id: "6", name: "flac_16_44" },
-      { id: "5", name: "mp3_320" },
-    ];
-  }
-
-  // Qobuz format_id is a requested maximum, not a promise about the
-  // catalog metadata returned by search. For `best`, ask for the highest
-  // available format first, then gracefully fall back if that release does
-  // not actually have Hi-Res. This is important for /search because search
-  // metadata can report only CD-quality fields even when playback can return
-  // a Hi-Res master.
-  return [
-    { id: "27", name: "flac_24_192" },
-    { id: "7", name: "flac_24_96" },
-    { id: "6", name: "flac_16_44" },
-    { id: "5", name: "mp3_320" },
-  ];
-}
-
-function signedRequestParams(objectMethod, params, appSecret) {
-  const requestTs = Math.floor(Date.now() / 1000).toString();
-  const keys = Object.keys(params || {}).sort();
-  let signatureInput = objectMethod;
-
-  for (const key of keys) {
-    const value = params[key];
-    if (value === undefined || value === null) continue;
-    signatureInput += `${key}${value}`;
-  }
-
-  signatureInput += `${requestTs}${appSecret}`;
-
-  return {
-    ...params,
-    request_ts: requestTs,
-    request_sig: md5(signatureInput),
-  };
-}
-
-function signedFileUrlParams(trackId, formatId, appSecret, intent = "stream") {
-  return signedRequestParams(
-    "trackgetFileUrl",
-    {
-      format_id: String(formatId),
-      intent,
-      track_id: String(trackId),
-    },
-    appSecret
-  );
-}
-
-function signedSessionStartParams(appSecret) {
-  return signedRequestParams(
-    "sessionstart",
-    { profile: "qbz-1" },
-    appSecret
-  );
-}
-
-function signedModernFileUrlParams(trackId, formatId, appSecret, intent = "stream") {
-  return signedRequestParams(
-    "fileurl",
-    {
-      format_id: String(formatId),
-      intent,
-      track_id: String(trackId),
-    },
-    appSecret
-  );
-}
-
-async function getQobuzSession(env, { token, appId, appSecret, slot }) {
-  const cacheKey = `${slot}:${appId}`;
-  const cached = qobuzSessionCache.get(cacheKey);
-
-  if (cached && cached.expiresAt > Date.now() + 30_000) {
-    return cached;
-  }
-
-  const query = signedSessionStartParams(appSecret);
-  const response = await qobuzRequest("session/start", {
-    token,
-    appId,
-    query,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    timeoutMs: 7000,
-    retries: 1,
-  });
-
-  const parsed = await readResponse(response);
-  const sessionId = parsed.json?.session_id || parsed.json?.sessionId || null;
-
-  if (!parsed.ok || !sessionId) {
-    const error = new Error(
-      parsed.json?.message ||
-      parsed.json?.error ||
-      `Qobuz session/start failed with HTTP ${parsed.status}`
-    );
-    error.status = parsed.status;
-    error.qobuz = parsed.json;
-    throw error;
-  }
-
-  const expiresAt = Number(parsed.json?.expires_at || 0) * 1000;
-  const session = {
-    sessionId,
-    infos: parsed.json?.infos || null,
-    expiresAt: expiresAt > Date.now() ? expiresAt : Date.now() + QOBUZ_SESSION_TTL_MS,
-  };
-
-  qobuzSessionCache.set(cacheKey, session);
-  return session;
-}
-
-async function resolveModernFileUrl(env, {
-  trackId,
-  formatId,
-  intent,
-  token,
-  appId,
-  appSecret,
-  slot,
-}) {
-  const session = await getQobuzSession(env, {
-    token,
-    appId,
-    appSecret,
-    slot,
-  });
-  const sessionId = session.sessionId;
-
-  const query = signedModernFileUrlParams(trackId, formatId, appSecret, intent);
-
-  const response = await qobuzRequest("file/url", {
-    token,
-    appId,
-    query,
-    headers: {
-      "X-Session-Id": sessionId,
-    },
-    timeoutMs: 7000,
-    retries: 1,
-  });
-
-  const parsed = await readResponse(response);
-  const streamUrl =
-    parsed.json?.url ||
-    parsed.json?.streamUrl ||
-    parsed.json?.stream_url ||
-    parsed.json?.file_url ||
-    parsed.json?.fileUrl ||
-    null;
-
-  return {
-    response,
-    parsed,
-    url: streamUrl,
-    url_template: parsed.json?.url_template || null,
-    n_segments: Number(parsed.json?.n_segments || 0) || null,
-    encryption_key: parsed.json?.key || null,
-    session_id: sessionId,
-    session_infos: session.infos || null,
-    format_id: String(formatId),
-    signing_mode: "modern_session_file_url",
-  };
-}
-
-async function resolveLegacyFileUrl(env, {
-  trackId,
-  formatId,
-  intent,
-  token,
-  appId,
-  appSecret,
-}) {
-  const query = signedFileUrlParams(trackId, formatId, appSecret, intent);
-
-  const response = await qobuzRequest("track/getFileUrl", {
-    token,
-    appId,
-    query,
-    timeoutMs: 7000,
-    retries: 1,
-  });
-
-  const parsed = await readResponse(response);
-  const streamUrl =
-    parsed.json?.url ||
-    parsed.json?.streamUrl ||
-    parsed.json?.stream_url ||
-    parsed.json?.file_url ||
-    parsed.json?.fileUrl ||
-    null;
-
-  return {
-    response,
-    parsed,
-    url: streamUrl,
-    format_id: String(formatId),
-    signing_mode: "legacy_track_getFileUrl",
-  };
-}
-
-
-async function resolveDirectLegacyStream(env, {
-  track,
-  trackId,
-  quality = "best",
-  preferredTokenSlot = null,
-}) {
-  const formats = qualityPlan(track, quality);
-  const tokens = orderedTokens(env, preferredTokenSlot);
-  let lastError = null;
-
-  for (const tokenEntry of tokens) {
-    if (!tokenAvailable(tokenEntry.slot) && tokens.length > 1) continue;
-
-    const candidates = tokenEntry.credential_candidates?.length
-      ? tokenEntry.credential_candidates
-      : [{
-          credential_slot: tokenEntry.slot,
-          appId: tokenEntry.appId,
-          appSecret: tokenEntry.appSecret,
-          credential_source: tokenEntry.credential_source,
-        }];
-
-    for (const credentials of candidates) {
-      for (const fmt of formats) {
-        try {
-          const legacy = await resolveLegacyFileUrl(env, {
-            trackId,
-            formatId: fmt.id,
-            intent: "stream",
-            token: tokenEntry.token,
-            appId: credentials.appId,
-            appSecret: credentials.appSecret,
-          });
-
-          if (legacy.parsed.ok && legacy.url) {
-            markTokenSuccess(tokenEntry.slot);
-            return {
-              ...legacy,
-              token_slot: tokenEntry.slot,
-              credential_slot: credentials.credential_slot,
-              credential_source: credentials.credential_slot === tokenEntry.slot
-                ? credentials.credential_source
-                : "cross_slot_fallback",
-              format_name: fmt.name || null,
-              mime_type: legacy.parsed.json?.mime_type ||
-                (String(fmt.id) === "5" ? "audio/mpeg" : "audio/flac"),
-              bit_depth: numberOrNull(legacy.parsed.json?.bit_depth) ??
-                (String(fmt.id) === "5" ? null : String(fmt.id) === "6" ? 16 : 24),
-              sampling_rate: numberOrNull(legacy.parsed.json?.sampling_rate) ??
-                (String(fmt.id) === "5" ? null : String(fmt.id) === "6" ? 44100 : null),
-              bitrate: numberOrNull(legacy.parsed.json?.bitrate) ??
-                (String(fmt.id) === "5" ? 320 : null),
-            };
-          }
-
-          lastError = new Error(
-            legacy.parsed.json?.message ||
-            legacy.parsed.json?.error ||
-            `Qobuz legacy playback failed with HTTP ${legacy.parsed.status}`
-          );
-          lastError.status = legacy.parsed.status;
-          lastError.qobuz = legacy.parsed.json;
-        } catch (error) {
-          lastError = error;
-        }
-      }
-    }
-  }
-
-  throw lastError || new Error("Qobuz direct stream URL could not be resolved");
-}
-
-async function resolveOneFormat(env, {
-  trackId,
-  formatId,
-  intent,
-  token,
-  appId,
-  appSecret,
-  slot,
-  allowLegacy = false,
-}) {
-  let modernError = null;
-
-  try {
-    const modern = await resolveModernFileUrl(env, {
-      trackId,
-      formatId,
-      intent,
-      token,
-      appId,
-      appSecret,
-      slot,
-    });
-
-    if (modern.parsed.ok && (modern.url || modern.url_template)) {
-      return modern;
-    }
-
-    modernError = new Error(
-      modern.parsed.json?.message ||
-      modern.parsed.json?.error ||
-      `Qobuz file/url failed with HTTP ${modern.parsed.status}`
-    );
-    modernError.status = modern.parsed.status;
-    modernError.qobuz = modern.parsed.json;
-  } catch (error) {
-    modernError = error;
-  }
-
-  if (!allowLegacy) {
-    throw modernError || new Error("Qobuz modern playback failed");
-  }
-
-  const legacy = await resolveLegacyFileUrl(env, {
-    trackId,
-    formatId,
-    intent,
-    token,
-    appId,
-    appSecret,
-  });
-
-  if (legacy.parsed.ok && legacy.url) {
-    return legacy;
-  }
-
-  const error = new Error(
-    legacy.parsed.json?.message ||
-    legacy.parsed.json?.error ||
-    modernError?.message ||
-    `Qobuz playback failed with HTTP ${legacy.parsed.status}`
-  );
-  error.status = legacy.parsed.status || modernError?.status;
-  error.qobuz = legacy.parsed.json || modernError?.qobuz;
-  throw error;
-}
-
-async function resolveStream(env, {
-  track,
-  trackId,
-  quality = "best",
-  preferredTokenSlot = null,
-}) {
-  const cacheKeyValue =
-    `stream:${trackId}:${String(quality).toLowerCase()}`;
-
-  const cached = memoryGet(
-    memoryStreamCache,
-    cacheKeyValue,
-    STREAM_URL_CACHE_TTL
-  );
-
-  if (cached) {
-    return { ...cached, cache: "memory" };
-  }
-
-  const pending = pendingStreams.get(cacheKeyValue);
-  if (pending) {
-    const value = await pending;
-    return { ...value, cache: "coalesced" };
-  }
-
-  const task = (async () => {
-    const formats = qualityPlan(track, quality);
-    const attempts = [];
-
-    const tokens = orderedTokens(env, preferredTokenSlot);
-    if (!tokens.length) {
-      throw Object.assign(new Error("No Qobuz auth tokens configured"), { status: 500 });
-    }
-
-    for (const tokenEntry of tokens) {
-      if (!tokenAvailable(tokenEntry.slot) && tokens.length > 1) continue;
-
-      for (const fmt of formats) {
-        const started = Date.now();
-
-        try {
-          const candidates = tokenEntry.credential_candidates?.length
-            ? tokenEntry.credential_candidates
-            : [{
-                credential_slot: tokenEntry.slot,
-                appId: tokenEntry.appId,
-                appSecret: tokenEntry.appSecret,
-                credential_source: tokenEntry.credential_source,
-              }];
-
-          let result = null;
-          let lastError = null;
-
-          for (const credentials of candidates) {
-            try {
-              result = await resolveOneFormat(env, {
-                trackId,
-                formatId: fmt.id,
-                intent: "stream",
-                token: tokenEntry.token,
-                appId: credentials.appId,
-                appSecret: credentials.appSecret,
-                slot: tokenEntry.slot,
-                allowLegacy: true,
-              });
-
-              if (result.parsed.ok && (result.url || result.url_template)) {
-                result.credential_slot = credentials.credential_slot;
-                result.credential_source = credentials.credential_slot === tokenEntry.slot
-                  ? credentials.credential_source
-                  : "cross_slot_fallback";
-                break;
-              }
-            } catch (error) {
-              lastError = error;
-              if (error?.code !== "INVALID_REQUEST_SIGNATURE") throw error;
-            }
-          }
-
-          if (!result || !result.parsed?.ok || (!result.url && !result.url_template)) {
-            if (lastError) throw lastError;
-            throw new Error("Qobuz modern playback failed for every configured App ID/App Secret pair");
-          }
-
-          const status = result.parsed.status;
-
-          attempts.push({
-            token_slot: tokenEntry.slot,
-            credential_slot: result.credential_slot ?? tokenEntry.slot,
-            credential_source: result.credential_source || tokenEntry.credential_source,
-            format_id: fmt.id,
-            status,
-            ok: result.parsed.ok,
-            has_url: Boolean(result.url),
-            has_segmented_stream: Boolean(result.url_template),
-            signing_mode: result.signing_mode || null,
-            error:
-              result.parsed.json?.message ||
-              result.parsed.json?.error ||
-              null,
-            duration_ms: Date.now() - started,
-          });
-
-          if (result.parsed.ok && (result.url || result.url_template)) {
-            markTokenSuccess(tokenEntry.slot);
-
-            const json = result.parsed.json || {};
-            const value = {
-              url: result.url || null,
-              url_template: result.url_template || null,
-              n_segments: result.n_segments || null,
-              encryption_key: result.encryption_key || null,
-              session_id: result.session_id || null,
-              format_id: String(result.format_id),
-              mime_type:
-                json.mime_type ||
-                (String(fmt.id) === "5" ? "audio/mpeg" : "audio/flac"),
-              bit_depth:
-                numberOrNull(json.bit_depth) ??
-                (String(fmt.id) === "5" ? null : String(fmt.id) === "6" ? 16 : 24),
-              sampling_rate:
-                numberOrNull(json.sampling_rate) ??
-                (String(fmt.id) === "5" ? null : String(fmt.id) === "6" ? 44100 : null),
-              bitrate:
-                numberOrNull(json.bitrate) ??
-                (String(fmt.id) === "5" ? 320 : null),
-              duration:
-                numberOrNull(json.duration) ??
-                numberOrNull(track?.duration),
-              restrictions: json.restrictions || [],
-              sample: Boolean(json.sample),
-              file_type: json.file_type || "full",
-              format_name: fmt.name,
-              token_slot: tokenEntry.slot,
-              credential_slot: result.credential_slot ?? tokenEntry.slot,
-              credential_source: result.credential_source || tokenEntry.credential_source,
-              attempts,
-            };
-
-            memorySet(
-              memoryStreamCache,
-              cacheKeyValue,
-              { savedAt: Date.now(), value },
-              MAX_MEMORY_STREAM_CACHE
-            );
-
-            return { ...value, cache: "miss" };
-          }
-
-          if (status === 401 || status === 403) {
-            markTokenFailure(
-              tokenEntry.slot,
-              status,
-              result.parsed.json?.message || `HTTP ${status}`
-            );
-            break;
-          }
-
-          if (!isTransientStatus(status)) {
-            // A format-specific failure can be legitimate, so continue
-            // to the next quality before abandoning the token.
-          }
-        } catch (error) {
-          attempts.push({
-            token_slot: tokenEntry.slot,
-            format_id: fmt.id,
-            status: error?.status || null,
-            ok: false,
-            has_url: false,
-            error: error?.message || String(error),
-            duration_ms: Date.now() - started,
-          });
-        }
-      }
-    }
-
-    const error = new Error("No Qobuz stream URL could be resolved");
-    error.status = 502;
-    error.attempts = attempts;
-    throw error;
-  })();
-
-  pendingStreams.set(cacheKeyValue, task);
-
-  try {
-    return await task;
-  } finally {
-    pendingStreams.delete(cacheKeyValue);
-  }
-}
-
-/* =========================================================
- * Track response
- * ========================================================= */
-
-async function getTrackById(env, id, ctx) {
-  const key = cacheKey("track", id);
-  const memoryHit = getMemoryTrack(key);
-  if (memoryHit) return { track: memoryHit, source: "memory", tokenSlot: null };
-
-  const kv = await getCachedMetadata(env, key);
-  if (kv?.id) {
-    cacheMemoryTrack(key, kv);
-    return { track: kv, source: "kv", tokenSlot: null };
-  }
-
-  const result = await catalogJson(env, "track/get", {
-    track_id: id,
-  });
-
-  const track = result.json?.track || result.json;
-  if (!track?.id) return { track: null, source: "miss", tokenSlot: result.tokenSlot };
-
-  cacheMemoryTrack(key, track);
-  saveMetadata(env, ctx, key, track);
-
-  return { track, source: "miss", tokenSlot: result.tokenSlot };
-}
-
-async function richTrackResponse(env, ctx, url) {
-  const id = cleanString(url.searchParams.get("id") || url.searchParams.get("track_id"));
-  const isrc = normalizeIsrc(url.searchParams.get("isrc") || url.searchParams.get("i"));
-  const query = cleanString(
-    url.searchParams.get("q") ||
-    url.searchParams.get("query") ||
-    url.searchParams.get("track")
-  );
-  const artist = cleanString(url.searchParams.get("artist"));
-  const quality = url.searchParams.get("quality") || url.searchParams.get("format") || "best";
-  const startedAt = Date.now();
-
-  let lookup;
-  let track;
-
-  if (id) {
-    lookup = await getTrackById(env, id, ctx);
-    track = lookup.track;
-  } else if (isrc) {
-    lookup = await findTrackByIsrc(env, isrc, null, ctx);
-    track = lookup.track;
-  } else if (query) {
-    const searchUrl = new URL("https://internal/search");
-    searchUrl.searchParams.set("q", query);
-    const result = await searchCatalog(env, searchUrl);
-    const candidates = result?.data || [];
-    track = candidates.find((x) => {
-      if (!artist) return true;
-      return String(x?.artist?.name || "").toLowerCase() === artist.toLowerCase();
-    }) || candidates[0] || null;
-    lookup = { track, source: "search", tokenSlot: result?.tokenSlot || null };
-  } else {
-    throw Object.assign(
-      new Error("Missing id, track_id, isrc, q, query, or track"),
-      { status: 400 }
-    );
-  }
-
-  if (!track?.id) {
-    throw Object.assign(new Error("Track not found"), { status: 404 });
-  }
-
-  const normalized = normalizeTrack(track);
-  const playback = await resolveStream(env, {
-    track,
-    trackId: String(track.id),
-    quality,
-    preferredTokenSlot:
-      Number(url.searchParams.get("token")) || lookup?.tokenSlot || null,
-  });
-
-  const total = Date.now() - startedAt;
-
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    id: String(track.id),
-    track_id: String(track.id),
-    isrc: normalizeIsrc(track.isrc || isrc) || null,
-    title: track.title || null,
-    artist:
-      track.performer?.name ||
-      track.artist?.name ||
-      normalized.artist?.name ||
-      "Unknown",
-    album: track.album?.title || null,
-
-    // Rich normalized metadata
-    metadata: normalized,
-
-    // Playback
-    format_id: playback.format_id,
-    format: playback.format_name,
-    mime_type: playback.mime_type,
-    streamUrl: playback.url,
-    stream_url_template: playback.url_template || null,
-    stream_segments: playback.n_segments || null,
-    stream_type: playback.url ? "direct_url" : playback.url_template ? "segmented" : null,
-    bitrate: playback.bitrate,
-    bit_depth: playback.bit_depth,
-    sampling_rate: playback.sampling_rate,
-    duration: playback.duration,
-    sample: playback.sample,
-    file_type: playback.file_type,
-    restrictions: playback.restrictions,
-
-    // Diagnostics
-    token_slot: playback.token_slot || lookup?.tokenSlot || null,
-    diagnostics: {
-      cache: {
-        metadata: lookup?.source || "miss",
-        stream: playback.cache || "miss",
+      provider: "deezer",
+      name: "Voria Deezer HiFi API",
+      cache: { namespace: "GENERAL_MUSIC_CACHE", keyPrefix: "music:deezer:" },
+      compatibleStyle: "hifi-api",
+      capabilities: {
+        info: true,
+        track: true,
+        stream: true,
+        search: true,
+        album: true,
+        artist: true,
+        playlist: true,
+        lyrics: true,
+        cover: true,
+        recommendations: true,
+        radio: true,
+        similarArtists: true,
+        similarAlbums: true,
       },
-      formats_tried: playback.attempts || [],
-      elapsed_ms: total,
-    },
-  };
-}
-
-/* =========================================================
- * Qobuz catalog routes
- * ========================================================= */
-
-async function routeSearch(env, url) {
-  return searchCatalog(env, url);
-}
-
-async function routeAlbum(env, url, ctx) {
-  const id = cleanString(url.searchParams.get("id") || url.searchParams.get("album_id"));
-  if (!id) throw Object.assign(new Error("Missing album id"), { status: 400 });
-
-  const { limit, offset } = getLimitOffset(url);
-  const key = cacheKey("album", `${id}:${offset}:${limit}`);
-
-  const cached = await getCachedMetadata(env, key);
-  if (cached) return { version: API_VERSION, provider: "qobuz", data: cached, cache: "kv" };
-
-  const result = await catalogJson(env, "album/get", {
-    album_id: id,
-    offset,
-    limit,
-    extra: url.searchParams.get("extra") || "track_ids",
-  });
-
-  const album = result.json?.album || result.json;
-  const normalized = normalizeAlbum(album);
-
-  let tracks = null;
-  if (Array.isArray(album?.tracks?.items)) {
-    tracks = {
-      data: album.tracks.items.map(normalizeTrack).filter(Boolean),
-      total: numberOrNull(album.tracks.total) ?? album.tracks.items.length,
-      offset: numberOrNull(album.tracks.offset) ?? offset,
-      limit: numberOrNull(album.tracks.limit) ?? limit,
-    };
+      endpoints: ["/info", "/track", "/stream", "/search", "/album", "/artist", "/playlist", "/lyrics", "/cover", "/recommendations", "/radio", "/artist/similar", "/album/similar", "/chart", "/genre", "/ping"],
+    }, 200, 30);
   }
 
-  const data = {
-    ...normalized,
-    token_slot: result.tokenSlot,
-    tracks,
-    raw_streamable: album?.streamable ?? null,
-  };
-
-  saveMetadata(env, ctx, key, data);
-  return { version: API_VERSION, provider: "qobuz", data, cache: "miss" };
-}
-
-async function routeArtist(env, url, ctx) {
-  const id = cleanString(url.searchParams.get("id") || url.searchParams.get("artist_id"));
-  if (!id) throw Object.assign(new Error("Missing artist id"), { status: 400 });
-
-  const { limit, offset } = getLimitOffset(url);
-
-  const result = await catalogJson(env, "artist/page", {
-    artist_id: id,
-  });
-
-  const page = result.json;
-  const artist = page?.artist || page;
-  const releases =
-    page?.albums ||
-    page?.releases ||
-    page?.discography ||
-    null;
-
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    data: {
-      ...normalizeArtist(artist),
-      token_slot: result.tokenSlot,
-      biography: artist?.biography || page?.biography || null,
-      albums: releases
-        ? normalizeCollection({ albums: releases }, "albums", normalizeAlbum)
-        : null,
-      similar_artists:
-        page?.similar_artists ||
-        page?.similarArtists ||
-        null,
-    },
-  };
-}
-
-async function routePlaylist(env, url, ctx) {
-  const id = cleanString(url.searchParams.get("id") || url.searchParams.get("playlist_id"));
-  if (!id) throw Object.assign(new Error("Missing playlist id"), { status: 400 });
-
-  const { limit, offset } = getLimitOffset(url);
-
-  const result = await catalogJson(env, "playlist/get", {
-    playlist_id: id,
-    offset,
-    limit,
-    extra: "tracks",
-  });
-
-  const playlist = result.json?.playlist || result.json;
-
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    data: {
-      ...normalizePlaylist(playlist),
-      token_slot: result.tokenSlot,
-      tracks: normalizeCollection(playlist, "tracks", normalizeTrack),
-    },
-  };
-}
-
-async function routeCover(env, url) {
-  const id =
-    cleanString(url.searchParams.get("id")) ||
-    cleanString(url.searchParams.get("album_id")) ||
-    cleanString(url.searchParams.get("track_id")) ||
-    cleanString(url.searchParams.get("i"));
-
-  if (!id) throw Object.assign(new Error("Missing id"), { status: 400 });
-
-  let data;
-
-  if (url.searchParams.get("track_id")) {
-    const result = await catalogJson(env, "track/get", { track_id: id });
-    data = normalizeTrack(result.json?.track || result.json)?.image;
-  } else {
-    const result = await catalogJson(env, "album/get", { album_id: id });
-    data = normalizeAlbum(result.json?.album || result.json)?.image;
+  if (path === "/info") {
+    const id = requestUrl.searchParams.get("id") || requestUrl.searchParams.get("track_id");
+    const isrc = requestUrl.searchParams.get("isrc");
+    if (!id && !isrc) return apiErrorResponse("Missing id or isrc", 400);
+    const track = await discoverTrack({ id, isrc }, env);
+    if (!track?.id) return apiErrorResponse("Track not found", 404);
+    return catalogResponse({ version: API_VERSION, data: normalizeTrack(track) }, 200, 30);
   }
 
-  if (!data) throw Object.assign(new Error("Artwork not found"), { status: 404 });
-
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    id,
-    image: data,
-    urls: data,
-  };
-}
-
-async function routeSimilarArtist(env, url) {
-  const id = cleanString(url.searchParams.get("id") || url.searchParams.get("artist_id"));
-  if (!id) throw Object.assign(new Error("Missing artist id"), { status: 400 });
-
-  const result = await catalogJson(env, "artist/getSimilarArtists", { artist_id: id });
-  const collection = result.json?.artists || result.json?.similar_artists || result.json;
-  const items = Array.isArray(collection?.items) ? collection.items : Array.isArray(collection) ? collection : [];
-
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    route_used: "artist/getSimilarArtists",
-    data: items.map(normalizeArtist).filter(Boolean),
-    total: numberOrNull(collection?.total) ?? items.length,
-    token_slot: result.tokenSlot,
-  };
-}
-
-async function routeAlbumSimilar(env, url) {
-  return apiError(
-    "Qobuz does not expose a verified album-similarity endpoint in the API surface used by this worker.",
-    501,
-    {
-      capability: "album_similar",
-      supported: false,
-      alternatives: ["/artist/similar", "/radio"],
+  if (path === "/search") {
+    const isrc = requestUrl.searchParams.get("i");
+    const q = requestUrl.searchParams.get("q") || requestUrl.searchParams.get("s") || requestUrl.searchParams.get("a") || requestUrl.searchParams.get("al") || requestUrl.searchParams.get("p");
+    let type = (requestUrl.searchParams.get("type") || "").toLowerCase();
+    if (!type) {
+      if (requestUrl.searchParams.has("a")) type = "artist";
+      else if (requestUrl.searchParams.has("al")) type = "album";
+      else if (requestUrl.searchParams.has("p")) type = "playlist";
+      else type = "track";
     }
-  );
-}
+    if (!q && !isrc) return apiErrorResponse("Missing q", 400);
+    const allowed = new Set(["track", "album", "artist", "playlist", "podcast", "radio"]);
+    if (!allowed.has(type)) return apiErrorResponse(`Unsupported search type: ${type}`, 400, { supported: [...allowed] });
 
-async function routeRecommendations(env, url) {
-  const { limit, offset } = getLimitOffset(url);
-  const q = cleanString(url.searchParams.get("q") || url.searchParams.get("query"));
+    if (isrc) {
+      const track = await discoverTrack({ isrc }, env);
+      const items = track ? [normalizeTrack(track)] : [];
+      return catalogResponse({ version: API_VERSION, type: "track", query: isrc, data: items, total: items.length, next: null, previous: null }, 200, 30);
+    }
 
-  // Verified Qobuz discovery endpoint. This is a popularity/discovery feed,
-  // not a fake native personalized-recommendations endpoint.
-  if (q) {
-    const result = await catalogJson(env, "most-popular/get", {
-      query: q,
-      offset,
+    const params = {
+      q,
       limit,
-    });
-
-    return {
-      version: API_VERSION,
-      provider: "qobuz",
-      route_used: "most-popular/get",
-      mode: "most_popular",
-      token_slot: result.tokenSlot,
-      data: result.json?.tracks || result.json?.items || result.json,
+      index: offset,
+      ...(requestUrl.searchParams.get("order") ? { order: requestUrl.searchParams.get("order") } : {}),
+      ...(requestUrl.searchParams.has("strict") ? { strict: requestUrl.searchParams.get("strict") } : {}),
     };
+    const result = await publicApi(`search/${type}`, params);
+    const normalizer = type === "track" ? normalizeTrack : type === "album" ? normalizeAlbum : type === "artist" ? normalizeArtist : type === "playlist" ? normalizePlaylist : x => x;
+    return catalogResponse({ version: API_VERSION, type, query: q, ...normalizeCollection(result, normalizer) }, 200, 30);
   }
 
-  return apiError(
-    "Qobuz's verified personalized recommendation endpoint requires a POST dynamic/suggest request with listening context. Use /recommendations with q for the verified most-popular discovery feed.",
-    501,
-    {
-      capability: "recommendations",
-      supported: false,
-      verified_dynamic_endpoint: "dynamic/suggest",
-      usage: "/recommendations?q=artist-or-query",
+  if (path === "/album") {
+    const id = requestUrl.searchParams.get("id");
+    if (!id) return apiErrorResponse("Missing id", 400);
+    const album = await publicApi(`album/${encodeURIComponent(id)}`);
+    const tracks = await publicApi(`album/${encodeURIComponent(id)}/tracks`, { limit, index: offset });
+    const normalizedTracks = normalizeCollection(tracks, normalizeTrack);
+    return catalogResponse({ version: API_VERSION, data: normalizeAlbum(album), tracks: normalizedTracks.data, pagination: { total: normalizedTracks.total, next: normalizedTracks.next, previous: normalizedTracks.previous, limit, offset } }, 200, 120);
+  }
+
+  if (path === "/artist") {
+    const id = requestUrl.searchParams.get("id");
+    if (!id) return apiErrorResponse("Missing id", 400);
+    const artist = await publicApi(`artist/${encodeURIComponent(id)}`);
+    const mode = (requestUrl.searchParams.get("include") || "profile").toLowerCase();
+    const data = { version: API_VERSION, artist: normalizeArtist(artist) };
+    if (mode === "top" || mode === "all") {
+      const top = await publicApi(`artist/${encodeURIComponent(id)}/top`, { limit, index: offset });
+      data.top_tracks = normalizeCollection(top, normalizeTrack);
     }
-  );
-}
-
-async function routeRadio(env, url) {
-  const requestedLimit = getLimitOffset(url).limit;
-  const limit = Math.min(Math.max(requestedLimit || 20, 1), 50);
-  const seedTrackId = cleanString(url.searchParams.get("id") || url.searchParams.get("track_id"));
-  const seedArtistId = cleanString(url.searchParams.get("artist_id"));
-
-  if (!seedTrackId && !seedArtistId) {
-    throw Object.assign(new Error("Radio requires id/track_id or artist_id"), { status: 400 });
-  }
-
-  let seedTrack = null;
-  let seedArtist = null;
-  let tokenSlot = null;
-
-  if (seedTrackId) {
-    const seed = await catalogJson(env, "track/get", { track_id: seedTrackId });
-    tokenSlot = seed.tokenSlot;
-    seedTrack = seed.json?.track || seed.json;
-    seedArtist = seedTrack?.performer || seedTrack?.artist || null;
-  } else {
-    const artist = await catalogJson(env, "artist/page", { artist_id: seedArtistId });
-    tokenSlot = artist.tokenSlot;
-    const page = artist.json;
-    seedArtist = page?.artist || page;
-  }
-
-  const artistId = cleanString(seedArtist?.id || seedArtistId);
-  const artistName = cleanString(seedArtist?.name);
-  if (!artistId || !artistName) {
-    throw Object.assign(new Error("Qobuz radio seed did not contain a usable artist"), { status: 404 });
-  }
-
-  const similarResult = await catalogJson(env, "artist/getSimilarArtists", { artist_id: artistId }, tokenSlot);
-  const similarCollection = similarResult.json?.artists || similarResult.json?.similar_artists || similarResult.json;
-  const similarArtists = (Array.isArray(similarCollection?.items) ? similarCollection.items : Array.isArray(similarCollection) ? similarCollection : [])
-    .map(normalizeArtist)
-    .filter((artist) => artist?.id && String(artist.id) !== String(artistId));
-
-  const artistSeeds = [{ id: artistId, name: artistName, seed: true }];
-  for (const artist of similarArtists.slice(0, 10)) artistSeeds.push({ id: artist.id, name: artist.name, seed: false });
-
-  const perArtist = Math.max(2, Math.ceil(limit / Math.max(artistSeeds.length, 1)) + 1);
-  const searches = await Promise.all(artistSeeds.map(async (artist) => {
-    try {
-      const result = await catalogJson(env, "catalog/search", {
-        query: artist.name,
-        type: "tracks",
-        limit: perArtist,
-        offset: 0,
-      }, tokenSlot);
-      return (result.json?.tracks?.items || []).map(normalizeTrack).filter(Boolean);
-    } catch (_) {
-      return [];
+    if (mode === "albums" || mode === "all") {
+      const albums = await publicApi(`artist/${encodeURIComponent(id)}/albums`, { limit, index: offset });
+      data.albums = normalizeCollection(albums, normalizeAlbum);
     }
-  }));
-
-  const tracks = [];
-  const seen = new Set();
-  const seedId = seedTrack?.id != null ? String(seedTrack.id) : null;
-
-  for (let index = 0; tracks.length < limit; index++) {
-    let added = false;
-    for (const bucket of searches) {
-      const track = bucket[index];
-      if (!track || track.id == null) continue;
-      const id = String(track.id);
-      if (seen.has(id) || id === seedId) continue;
-      seen.add(id);
-      tracks.push(track);
-      added = true;
-      if (tracks.length >= limit) break;
+    if (mode === "radio" || mode === "all") {
+      const radio = await publicApi(`artist/${encodeURIComponent(id)}/radio`, { limit, index: offset });
+      data.radio = normalizeCollection(radio, normalizeTrack);
     }
-    if (!added) break;
+    if (mode === "related" || mode === "all") {
+      const related = await publicApi(`artist/${encodeURIComponent(id)}/related`, { limit, index: offset });
+      data.related = normalizeCollection(related, normalizeArtist);
+    }
+    return catalogResponse(data, 200, 120);
   }
 
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    route_used: "artist/getSimilarArtists + catalog/search",
-    radio_type: "generated_from_qobuz_catalog",
-    token_slot: tokenSlot,
-    seed: {
-      track: seedTrack ? normalizeTrack(seedTrack) : null,
-      artist: normalizeArtist(seedArtist),
-    },
-    similar_artists: similarArtists.slice(0, 10),
-    data: tracks,
-    total: tracks.length,
-  };
-}
+  if (path === "/playlist") {
+    const id = requestUrl.searchParams.get("id");
+    if (!id) return apiErrorResponse("Missing id", 400);
+    const playlist = await publicApi(`playlist/${encodeURIComponent(id)}`);
+    const trackResult = await publicApi(`playlist/${encodeURIComponent(id)}/tracks`, { limit, index: offset });
+    const normalizedTracks = normalizeCollection(trackResult, normalizeTrack);
+    return catalogResponse({ version: API_VERSION, data: normalizePlaylist(playlist), tracks: normalizedTracks.data, pagination: { total: normalizedTracks.total ?? toNumber(playlist?.nb_tracks), next: normalizedTracks.next, previous: normalizedTracks.previous, limit, offset } }, 200, 120);
+  }
 
-async function routeChart(env, url) {
-  const { limit, offset } = getLimitOffset(url);
-  const type = cleanString(url.searchParams.get("type")) || "new-releases";
-  const genreId = cleanString(url.searchParams.get("genre_id"));
+  if (path === "/cover") {
+    const id = requestUrl.searchParams.get("id");
+    const q = requestUrl.searchParams.get("q");
+    let track = null;
+    if (id) track = await discoverTrack({ id }, env);
+    else if (q) track = await discoverTrack({ query: q }, env);
+    else return apiErrorResponse("Missing id or q", 400);
+    if (!track?.id) return apiErrorResponse("Track not found", 404);
+    return catalogResponse({ version: API_VERSION, covers: [{ id: track.album?.id ?? null, name: track.album?.title ?? null, ...buildArtworkUrls(track.album?.cover_xl || track.album?.cover, "cover") }] }, 200, 300);
+  }
 
-  const query = { type, limit, offset };
-  if (genreId) query.genre_id = genreId;
+  if (path === "/recommendations") {
+    const id = requestUrl.searchParams.get("id") || requestUrl.searchParams.get("track_id");
+    if (!id) return apiErrorResponse("Missing id", 400);
+    const track = await discoverTrack({ id }, env);
+    if (!track?.id) return apiErrorResponse("Track not found", 404);
+    const artistId = track.artist?.id;
+    const result = artistId ? await publicApi(`artist/${encodeURIComponent(artistId)}/radio`, { limit, index: offset }) : { data: [] };
+    const items = (result?.data || []).filter(x => String(x.id) !== String(track.id)).map(normalizeTrack).filter(Boolean);
+    return catalogResponse({ version: API_VERSION, data: { limit, offset, total: items.length, items } }, 200, 30);
+  }
 
-  const result = await catalogJson(env, "album/getFeatured", query);
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    route_used: "album/getFeatured",
-    type,
-    genre_id: genreId,
-    token_slot: result.tokenSlot,
-    data: result.json?.albums || result.json?.items || result.json,
-  };
-}
+  if (path === "/radio") {
+    const artistId = requestUrl.searchParams.get("artist_id") || requestUrl.searchParams.get("id");
+    if (!artistId) return apiErrorResponse("Missing artist_id", 400);
+    const result = await publicApi(`artist/${encodeURIComponent(artistId)}/radio`, { limit, index: offset });
+    return catalogResponse({ version: API_VERSION, data: { ...normalizeCollection(result, normalizeTrack), limit, offset } }, 200, 30);
+  }
 
-async function routeGenre(env, url) {
-  const result = await catalogJson(env, "genre/list", {});
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    route_used: "genre/list",
-    token_slot: result.tokenSlot,
-    data: result.json?.genres || result.json,
-  };
-}
+  if (path === "/artist/similar") {
+    const id = requestUrl.searchParams.get("id");
+    if (!id) return apiErrorResponse("Missing id", 400);
+    const result = await publicApi(`artist/${encodeURIComponent(id)}/related`, { limit, index: offset });
+    return catalogResponse({ version: API_VERSION, ...normalizeCollection(result, normalizeArtist) }, 200, 300);
+  }
 
-async function routeLyrics(env, url) {
-  /*
-   * Qobuz's documented v0.2 catalog surface does not expose a stable
-   * lyrics endpoint equivalent to Deezer's synchronized lyrics API.
-   * Keep the route for API parity, but fail honestly.
-   */
-  return apiError(
-    "Qobuz does not expose a stable lyrics endpoint through the catalog API.",
-    501,
-    {
-      capability: "lyrics",
-      supported: false,
-      provider: "qobuz",
-    }
-  );
-}
-
-/* =========================================================
- * Token ping
- * ========================================================= */
-
-async function pingTokens(env) {
-  const tokens = getTokens(env);
-
-  if (!tokens.length) {
-    return {
-      provider: "qobuz",
+  if (path === "/chart") {
+    const genre = requestUrl.searchParams.get("genre") || requestUrl.searchParams.get("genre_id") || 0;
+    const result = await publicApi("chart", { limit, index: offset, genre });
+    return catalogResponse({
       version: API_VERSION,
-      configured_tokens: 0,
-      lossless_probe_track_id: null,
-      results: [],
-    };
+      genre_id: Number(genre) || 0,
+      tracks: normalizeCollection(result?.tracks || {}, normalizeTrack),
+      albums: normalizeCollection(result?.albums || {}, normalizeAlbum),
+      artists: normalizeCollection(result?.artists || {}, normalizeArtist),
+      playlists: normalizeCollection(result?.playlists || {}, normalizePlaylist),
+    }, 200, 60);
   }
 
-  const results = [];
-
-  for (const entry of tokens) {
-    const started = Date.now();
-
-    if (!entry.appId || !entry.appSecret) {
-      markTokenFailure(entry.slot, 500, "Missing App ID or App Secret for this token slot");
-      results.push({
-        slot: entry.slot,
-        status: "misconfigured",
-        http_status: 500,
-        elapsed_ms: Date.now() - started,
-        can_catalog: false,
-        can_lossless: false,
-        credential_source: entry.credential_source,
-        has_app_id: Boolean(entry.appId),
-        has_app_secret: Boolean(entry.appSecret),
-        error: "Missing Qobuz App ID or App Secret for this token slot",
-      });
-      continue;
+  if (path === "/genre") {
+    const id = requestUrl.searchParams.get("id");
+    if (id) {
+      const genre = await publicApi(`genre/${encodeURIComponent(id)}`);
+      return catalogResponse({ version: API_VERSION, data: genre }, 200, 3600);
     }
-
-    try {
-      // Do not use a hard-coded Deezer track ID here. Search Qobuz itself
-      // for a known track, then use the returned Qobuz track ID for the
-      // optional lossless entitlement probe.
-      const catalog = await catalogJson(
-        env,
-        "catalog/search",
-        {
-          query: "Blinding Lights The Weeknd",
-          type: "tracks",
-          limit: 1,
-          offset: 0,
-        },
-        entry.slot
-      );
-
-      const tracks = catalog.json?.tracks?.items || catalog.json?.tracks?.data || [];
-      const probeTrack = tracks[0] || null;
-      const probeTrackId = probeTrack?.id ? String(probeTrack.id) : null;
-
-      if (!probeTrackId) {
-        markTokenFailure(entry.slot, 404, "Qobuz catalog returned no probe track");
-        results.push({
-          slot: entry.slot,
-          status: "failed",
-          http_status: 404,
-          elapsed_ms: Date.now() - started,
-          can_catalog: false,
-          can_lossless: false,
-          credential_source: entry.credential_source,
-          error: "Qobuz catalog returned no track for the ping probe",
-        });
-        continue;
-      }
-
-      markTokenSuccess(entry.slot);
-      const result = {
-        slot: entry.slot,
-        status: "active",
-        http_status: catalog.response?.status || 200,
-        elapsed_ms: Date.now() - started,
-        can_catalog: true,
-        can_playback: false,
-        credential_source: entry.credential_source,
-        probe_track_id: probeTrackId,
-        probe_track_title: probeTrack?.title || null,
-        probe_track_artist: probeTrack?.artist?.name || null,
-      };
-
-      try {
-        const candidates = entry.credential_candidates?.length
-          ? entry.credential_candidates
-          : [{
-              credential_slot: entry.slot,
-              appId: entry.appId,
-              appSecret: entry.appSecret,
-              credential_source: entry.credential_source,
-            }];
-
-        let stream = null;
-        let lastError = null;
-
-        for (const credentials of candidates) {
-          try {
-            stream = await resolveOneFormat(env, {
-              trackId: probeTrackId,
-              formatId: "6",
-              intent: "stream",
-              token: entry.token,
-              appId: credentials.appId,
-              appSecret: credentials.appSecret,
-              slot: entry.slot,
-              allowLegacy: false,
-            });
-
-            if (stream.parsed.ok && (stream.url || stream.url_template)) {
-              stream.credential_slot = credentials.credential_slot;
-              stream.credential_source = credentials.credential_slot === entry.slot
-                ? credentials.credential_source
-                : "cross_slot_fallback";
-              break;
-            }
-          } catch (error) {
-            lastError = error;
-            if (error?.code !== "INVALID_REQUEST_SIGNATURE") throw error;
-          }
-        }
-
-        if (!stream || !stream.parsed?.ok || (!stream.url && !stream.url_template)) {
-          if (lastError) throw lastError;
-          throw new Error("Qobuz playback failed for every configured App ID/App Secret pair");
-        }
-
-        const playbackSucceeded = Boolean(
-          stream.parsed.ok && (stream.url || stream.url_template)
-        );
-        result.can_playback = playbackSucceeded;
-        result.playback_check = playbackSucceeded
-          ? "signed_playback_authorized"
-          : "playback_test_failed";
-        result.playback_http_status = stream.parsed.status;
-        result.playback_signing_mode = stream.signing_mode || null;
-        result.playback_stream_type = stream.url
-          ? "direct_url"
-          : stream.url_template
-            ? "segmented"
-            : null;
-        result.playback_segments = stream.n_segments || null;
-        result.playback_credential_slot = stream.credential_slot ?? entry.slot;
-        result.playback_credential_source = stream.credential_source || entry.credential_source;
-        result.playback_error =
-          stream.parsed.json?.message ||
-          stream.parsed.json?.error ||
-          null;
-
-        // A successful format-6 request proves signed lossless playback.
-        result.can_lossless = playbackSucceeded ? true : null;
-        result.lossless_check = playbackSucceeded
-          ? "flac_authorized"
-          : "unknown_due_to_playback_failure";
-        result.lossless_http_status = stream.parsed.status;
-        result.lossless_error = playbackSucceeded
-          ? null
-          : (stream.parsed.json?.message || stream.parsed.json?.error || null);
-      } catch (error) {
-        result.can_playback = false;
-        result.playback_check = "playback_test_error";
-        result.playback_error = error?.message || String(error);
-        result.playback_error_code = error?.code || null;
-
-        // Do not call this a lossless entitlement failure. We could not
-        // establish a valid signed playback request in the first place.
-        result.can_lossless = null;
-        result.lossless_check = error?.code === "INVALID_REQUEST_SIGNATURE"
-          ? "invalid_request_signature"
-          : "unknown_due_to_playback_failure";
-        result.lossless_error = error?.message || String(error);
-        if (error?.code === "INVALID_REQUEST_SIGNATURE") {
-          result.lossless_error_code = error.code;
-        }
-      }
-
-      results.push(result);
-    } catch (error) {
-      const status = error?.status || null;
-      markTokenFailure(entry.slot, status, error?.message);
-      results.push({
-        slot: entry.slot,
-        status:
-          status === 401 || status === 403
-            ? "expired_or_invalid"
-            : "failed",
-        http_status: status,
-        elapsed_ms: Date.now() - started,
-        can_catalog: false,
-        can_lossless: false,
-        credential_source: entry.credential_source,
-        error: error?.message || String(error),
-      });
-    }
+    const genres = await publicApi("genre");
+    return catalogResponse({ version: API_VERSION, ...normalizeCollection(genres, x => x) }, 200, 3600);
   }
 
-  const probe = results.find((x) => x.probe_track_id);
+  if (path === "/album/similar") {
+    const id = requestUrl.searchParams.get("id");
+    if (!id) return apiErrorResponse("Missing id", 400);
+    const album = await publicApi(`album/${encodeURIComponent(id)}`);
+    const artistId = album?.artist?.id;
+    if (!artistId) return catalogResponse({ version: API_VERSION, data: [] }, 200, 300);
+    const albums = await publicApi(`artist/${encodeURIComponent(artistId)}/albums`, { limit: Math.min(100, limit + 10), index: 0 });
+    const data = (albums?.data || []).filter(x => String(x.id) !== String(id)).slice(0, limit).map(normalizeAlbum).filter(Boolean);
+    return catalogResponse({ version: API_VERSION, data, total: data.length }, 200, 300);
+  }
 
-  return {
-    provider: "qobuz",
-    version: API_VERSION,
-    configured_tokens: tokens.length,
-    lossless_probe_track_id: probe?.probe_track_id || null,
-    results,
-  };
+  return null;
 }
 
-/* =========================================================
- * Root / info
- * ========================================================= */
+// -------------------------------------------------------------------------
+// MAIN FETCH HANDLER
+// -------------------------------------------------------------------------
 
-function rootInfo(env) {
-  const tokens = getTokens(env);
-
-  return {
-    version: API_VERSION,
-    provider: "qobuz",
-    name: "Qobuz HiFi API",
-      cache: { namespace: "GENERAL_MUSIC_CACHE", keyPrefix: "music:qobuz:" },
-    compatibleStyle: "hifi-api",
-    base: QOBUZ_BASE,
-    configured_tokens: tokens.length,
-    capabilities: {
-      info: true,
-      track: true,
-      stream: true,
-      search: true,
-      album: true,
-      artist: true,
-      playlist: true,
-      cover: true,
-      lyrics: false,
-      recommendations: true,
-      recommendations_mode: "most-popular (GET) or dynamic/suggest (POST, listening context)",
-      radio: "generated",
-      nativeRadio: false,
-      similarArtists: true,
-      similarAlbums: false,
-      chart: true,
-      genre: true,
-      multiToken: true,
-      tokenFailover: true,
-      isrcLookup: true,
-      hires192: true,
-      hires96: true,
-      cdQuality: true,
-      mp3320: true,
-      metadataCache: true,
-      streamUrlCache: true,
-    },
-    verified_qobuz_methods: [
-      "track/search",
-      "album/search",
-      "artist/search",
-      "playlist/search",
-      "catalog/search",
-      "track/get",
-      "album/get",
-      "artist/page",
-      "artist/getSimilarArtists",
-      "artist/getReleasesList",
-      "playlist/get",
-      "playlist/getUserPlaylists",
-      "genre/list",
-      "album/getFeatured",
-      "most-popular/get",
-      "session/start",
-      "file/url",
-      "track/getFileUrl"
-    ],
-    endpoints: [
-      "/",
-      "/info-api",
-      "/info",
-      "/track",
-      "/stream",
-      "/search",
-      "/album",
-      "/artist",
-      "/playlist",
-      "/cover",
-      "/lyrics",
-      "/recommendations",
-      "/radio",
-      "/artist/similar",
-      "/chart",
-      "/genre",
-      "/ping",
-    ],
-    token_environment: [
-      "QOBUZ_USER_AUTH_TOKEN",
-      "QOBUZ_USER_AUTH_TOKEN_2",
-      "...",
-      "QOBUZ_USER_AUTH_TOKEN_10",
-    ],
-  };
-}
-
-/* =========================================================
- * Optional direct CDN proxy
- * ========================================================= */
-
-async function proxyAudio(request, url) {
-  let sourceUrl = url.searchParams.get("url");
-
-  if (!sourceUrl) {
-    throw Object.assign(new Error("Missing url parameter"), { status: 400 });
-  }
-
-  try {
-    sourceUrl = decodeURIComponent(sourceUrl);
-  } catch (_) {}
-
-  let source;
-  try {
-    source = new URL(sourceUrl);
-  } catch (_) {
-    throw Object.assign(new Error("Invalid stream URL"), { status: 400 });
-  }
-
-  if (!/^https?:$/.test(source.protocol)) {
-    throw Object.assign(new Error("Unsupported stream URL protocol"), { status: 400 });
-  }
-
-  const headers = new Headers();
-  const range = request.headers.get("Range");
-  if (range) headers.set("Range", range);
-
-  const upstream = await fetch(source.toString(), {
-    method: request.method === "HEAD" ? "HEAD" : "GET",
-    headers,
-    redirect: "follow",
-  });
-
-  const outHeaders = new Headers(corsHeaders);
-  for (const name of [
-    "content-type",
-    "content-length",
-    "content-range",
-    "accept-ranges",
-    "etag",
-    "last-modified",
-  ]) {
-    const value = upstream.headers.get(name);
-    if (value) outHeaders.set(name, value);
-  }
-
-  outHeaders.set("Cache-Control", "no-store");
-
-  return new Response(
-    request.method === "HEAD" ? null : upstream.body,
-    {
-      status: upstream.status,
-      headers: outHeaders,
-    }
-  );
-}
-
-/* =========================================================
- * Main router
- * ========================================================= */
-
-export default {
-  async fetch(request, env, ctx) {
+const worker = {
+  async fetch(request, env) {
     if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders,
-      });
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    const requestUrl = new URL(request.url);
+    const routePath = requestUrl.pathname.replace(/\/+$/, "") || "/";
+
+    // --- DEEZER ARL HEALTH CHECK ---
+    // GET /ping or /?ping=1
+    if (routePath === "/ping" || requestUrl.searchParams.has("ping")) {
+      try {
+        const result = await pingAllArls(env);
+        return jsonResponse(result, result.error && !result.results?.length ? 500 : 200);
+      } catch (error) {
+        return jsonResponse({
+          error: "ARL ping failed",
+          message: error?.message || "Unknown error",
+        }, 500);
+      }
     }
 
     if (!["GET", "HEAD"].includes(request.method)) {
-      return apiError("Method not allowed", 405, {
-        allowedMethods: ["GET", "HEAD", "OPTIONS"],
+      return new Response("Method Not Allowed", {
+        status: 405,
+        headers: { ...corsHeaders, "Allow": "GET, HEAD, OPTIONS" },
       });
     }
 
-    const url = new URL(request.url);
-    const path = normalizePath(url.pathname);
-
-    // Health / token diagnostics
-    if (path === "/ping" || url.searchParams.has("ping")) {
-      try {
-        const result = await pingTokens(env);
-        return request.method === "HEAD"
-          ? new Response(null, {
-              status: 200,
-              headers: {
-                ...corsHeaders,
-                "Content-Type": "application/json",
-              },
-            })
-          : jsonResponse(result, 200);
-      } catch (error) {
-        return apiError(error?.message || "Qobuz ping failed", 500);
+    // --- HIFI-STYLE PUBLIC CATALOG API ---
+    // These routes are deliberately independent of ARL playback auth. They use
+    // Deezer's public catalog API, giving Voria a stable browser-facing API for
+    // metadata, discovery and artwork even when no playback account is usable.
+    if (routePath !== "/" && ["/info-api", "/info", "/track", "/search", "/album", "/artist", "/playlist", "/cover", "/recommendations", "/radio", "/artist/similar", "/album/similar", "/chart", "/genre"].includes(routePath)) {
+      // /track is an explicit alias for the normal rich playback pipeline.
+      if (routePath === "/track") {
+        // /track is an explicit alias for the existing rich playback response.
+        // Fall through to the normal playback pipeline below.
+      } else {
+        try {
+          const catalogResult = await handleCatalogRoute(requestUrl);
+          if (catalogResult) {
+            if (request.method === "HEAD") return new Response(null, { status: catalogResult.status, headers: catalogResult.headers });
+            return catalogResult;
+          }
+        } catch (error) {
+          return apiErrorResponse(error?.message || "Catalog request failed", error?.status >= 400 ? error.status : 502, error?.apiError || null);
+        }
       }
     }
 
-    // Root / capability information
-    if (path === "/" || path === "/info-api") {
-      const response = jsonResponse(rootInfo(env), 200, {
-        "Cache-Control": "public, max-age=30",
-        "X-Qobuz-API-Version": API_VERSION,
-      });
-      return request.method === "HEAD" ? headResponse(response) : response;
+    // --- RANGE-AWARE CHUNKED STREAM ENGINE ---
+    if (routePath === "/stream") {
+      if (request.method === "HEAD") {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "audio/flac",
+            "Accept-Ranges": "bytes",
+          },
+        });
+      }
+
+      try {
+        const trackId = requestUrl.searchParams.get("id");
+        const cdnUrl = requestUrl.searchParams.get("url");
+        const format = (requestUrl.searchParams.get("format") || "FLAC").toUpperCase();
+
+        if (!trackId || !cdnUrl) {
+          return new Response("Missing id or url parameter", { status: 400 });
+        }
+
+        const mimeType = format.startsWith("MP3") ? "audio/mpeg" : "audio/flac";
+        const cipher = new FastBlowfish(deriveTrackKey(trackId));
+
+        const rangeHeader = request.headers.get("Range");
+
+        let reqStart = 0;
+        let reqEnd = null;
+        let hasRange = false;
+
+        if (rangeHeader) {
+          const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+          if (match) {
+            hasRange = true;
+            reqStart = parseInt(match[1], 10);
+            if (match[2].length > 0) {
+              reqEnd = parseInt(match[2], 10);
+            }
+          }
+        }
+
+        const MAX_CHUNK = 6 * 1024 * 1024;
+        if (reqEnd === null || reqEnd - reqStart + 1 > MAX_CHUNK) {
+          reqEnd = reqStart + MAX_CHUNK - 1;
+        }
+
+        const startBlock = Math.floor(reqStart / 2048);
+        const alignedStart = startBlock * 2048;
+        const endBlock = Math.floor(reqEnd / 2048);
+        const alignedEnd = (endBlock + 1) * 2048 - 1;
+
+        const cdnResp = await fetch(cdnUrl, {
+          headers: {
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
+            "Range": `bytes=${alignedStart}-${alignedEnd}`,
+          },
+        });
+
+        if (!cdnResp.ok && cdnResp.status !== 206) {
+          return new Response(`CDN error: ${cdnResp.status}`, { status: cdnResp.status });
+        }
+
+        const contentRange = cdnResp.headers.get("content-range") || "";
+        const totalMatch = contentRange.match(/\/(\d+)/);
+        const totalSize = totalMatch ? parseInt(totalMatch[1], 10) : (alignedEnd + 1);
+
+        const rawBytes = new Uint8Array(await cdnResp.arrayBuffer());
+
+        decryptAlignedBuffer(cipher, rawBytes, startBlock);
+
+        const offsetInFirstBlock = reqStart - alignedStart;
+        const actualEnd = Math.min(reqEnd, totalSize - 1);
+        const sliceLength = Math.max(0, actualEnd - reqStart + 1);
+        const clientSlice = rawBytes.subarray(offsetInFirstBlock, offsetInFirstBlock + sliceLength);
+
+        const headers = new Headers(corsHeaders);
+        headers.set("Content-Type", mimeType);
+        headers.set("Content-Length", clientSlice.length.toString());
+        headers.set("Accept-Ranges", "bytes");
+        headers.set("Cache-Control", "public, max-age=3600");
+
+        if (hasRange) {
+          headers.set("Content-Range", `bytes ${reqStart}-${actualEnd}/${totalSize}`);
+          return new Response(clientSlice, { status: 206, headers });
+        } else {
+          return new Response(clientSlice, { status: 200, headers });
+        }
+      } catch (streamErr) {
+        return new Response(`Stream error: ${streamErr.message}`, { status: 500, headers: corsHeaders });
+      }
+    }
+
+    // --- PARAMETER PARSING ---
+    const paramId = requestUrl.searchParams.get("id") || requestUrl.searchParams.get("track_id");
+    const paramIsrc = requestUrl.searchParams.get("isrc") || requestUrl.searchParams.get("i");
+    const paramQuery = requestUrl.searchParams.get("q") || requestUrl.searchParams.get("query") || requestUrl.searchParams.get("track");
+    const paramArtist = requestUrl.searchParams.get("artist");
+    if (!paramId && !paramIsrc && !paramQuery && !paramArtist) {
+      try {
+        return await handleCatalogRoute(requestUrl);
+      } catch (error) {
+        return apiErrorResponse(error?.message || "Catalog request failed", error?.status >= 400 ? error.status : 502, error?.apiError || null);
+      }
+    }
+
+    const hasExplicitQuality = requestUrl.searchParams.has("quality") || requestUrl.searchParams.has("format");
+    const rawQuality = (requestUrl.searchParams.get("quality") || requestUrl.searchParams.get("format") || "best").toLowerCase().trim();
+
+    if (hasExplicitQuality && rawQuality !== "best" && !QUALITY_MAP[rawQuality]) {
+      return jsonResponse(
+        {
+          error: `Invalid quality requested: "${rawQuality}"`,
+          supported_qualities: ["best", "flac", "320", "128"],
+        },
+        400
+      );
+    }
+
+    // Automatic playback uses a strict two-stage fallback across ALL ARLs:
+    //   1. Try FLAC on every configured account.
+    //   2. Only if every account fails FLAC, try MP3_128 on every account.
+    //
+    // This is intentionally different from trying FLAC -> 320 -> 128 on ARL #1
+    // before ever checking ARL #2. A lossy ARL must not prevent a later HiFi ARL
+    // from being selected.
+    const formatsToTry = hasExplicitQuality
+      ? [rawQuality === "best" ? "flac" : rawQuality]
+      : ["flac", "128"];
+    const arls = Array.from({ length: 10 }, (_, i) =>
+      env[`DEEZER_ARL${i ? `_${i + 1}` : ""}`]?.trim()
+    ).filter(Boolean);
+
+    if (!arls.length) {
+      return jsonResponse({ error: "Missing DEEZER_ARL environment variable(s)" }, 500);
     }
 
     try {
-      if (path === "/info") {
-        const data = await richTrackResponse(env, ctx, url);
-        const response = jsonResponse(data, 200, {
-          "Cache-Control": "no-store",
-          "X-Qobuz-Token": String(data.token_slot || "unknown"),
-          "X-Qobuz-Format": String(data.format_id || "unknown"),
-        });
-        return request.method === "HEAD" ? headResponse(response) : response;
+      // Track discovery is provider-level and does not require an ARL.
+      // Track discovery
+      const track = await discoverTrack({
+        id: paramId,
+        isrc: paramIsrc,
+        query: paramQuery,
+        artist: paramArtist,
+      }, env);
+
+      if (!track?.id) {
+        return jsonResponse({ error: "Track not found" }, 404);
       }
 
-      if (path === "/track") {
-        const data = await richTrackResponse(env, ctx, url);
-        const response = jsonResponse(data, 200, {
-          "Cache-Control": "no-store",
-          "X-Qobuz-Token": String(data.token_slot || "unknown"),
-          "X-Qobuz-Format": String(data.format_id || "unknown"),
-        });
-        return request.method === "HEAD" ? headResponse(response) : response;
-      }
-
-      if (path === "/stream") {
-        /*
-         * /stream?isrc=... or /stream?id=...
-         * returns a fresh signed URL.
-         *
-         * /stream?url=...&proxy=1
-         * proxies an already-resolved Qobuz CDN URL and honors Range.
-         */
-        if (url.searchParams.get("proxy") === "1" || url.searchParams.has("url")) {
-          const response = await proxyAudio(request, url);
-          return response;
+      // Do NOT trust USER.OPTIONS.can_stream_lossless for playback selection.
+      // Deezer can report that flag as false even when the ARL can actually
+      // resolve FLAC. The real test is whether the media endpoint accepts a
+      // FLAC request for this account and this track.
+      //
+      // Authenticate all ARLs first. We then try them in slot order and let the
+      // actual FLAC media request decide whether the account is lossless-capable.
+      // If ARL #1 is lossy and ARL #2 is lossless, #1's FLAC request fails and
+      // #2's FLAC request succeeds, so #2 is selected automatically.
+      const candidates = await Promise.all(arls.map(async (candidateArl, index) => {
+        try {
+          const candidateSession = await getOrRenewSession(candidateArl);
+          return {
+            arl: candidateArl,
+            slot: index + 1,
+            session: candidateSession,
+          };
+        } catch (err) {
+          clearArlCache(candidateArl);
+          return {
+            arl: candidateArl,
+            slot: index + 1,
+            session: null,
+          };
         }
+      }));
 
-        const data = await richTrackResponse(env, ctx, url);
+      let session = null;
+      let arl = null;
+      let selectedArlSlot = null;
+      let selectedArlTier = null;
+      let trackData = null;
+      let mediaResult = null;
+      let selectedProfile = null;
+      let lastMediaError = null;
 
-        // Mirror the Deezer worker's convenient redirect mode.
-        // stream=1 returns the fresh signed Qobuz CDN URL directly.
-        if (url.searchParams.get("stream") === "1" && !url.searchParams.has("json")) {
-          if (!data.streamUrl) {
-            return jsonResponse({
-              error: "Qobuz returned a segmented modern stream",
-              code: "SEGMENTED_STREAM",
-              stream_type: data.stream_type,
-              url_template: data.stream_url_template,
-              n_segments: data.stream_segments,
-            }, 409);
+      // Automatic mode is intentionally account-first by quality tier:
+      // check FLAC against every authenticated ARL before allowing a lossy
+      // fallback. This makes ARL #2 capable of winning even when ARL #1 is
+      // valid but only has 128 kbps access.
+      const qualityStages = hasExplicitQuality
+        ? [[rawQuality === "best" ? "flac" : rawQuality]]
+        : [["flac"], ["128"]];
+
+      let selected = false;
+
+      for (const stage of qualityStages) {
+        if (selected) break;
+
+        for (const candidate of candidates) {
+          if (!candidate.session) continue;
+
+          try {
+            const candidateArl = candidate.arl;
+            const candidateSession = candidate.session;
+            const candidateTrackData = await getTrackTokens(
+              candidateArl,
+              candidateSession,
+              track.id
+            );
+
+            if (!candidateTrackData?.TRACK_TOKEN) {
+              throw new Error("No playable TRACK_TOKEN");
+            }
+
+            const requestedKey = stage[0];
+            const requestedProfile = QUALITY_MAP[requestedKey];
+            const resolved = await resolveMediaStream(
+              candidateSession.licenseToken,
+              candidateTrackData.TRACK_TOKEN,
+              requestedProfile.format
+            );
+
+            // Never accept a silent downgrade as a successful FLAC attempt.
+            // If Deezer returns MP3_128 for a FLAC request, this account has
+            // not actually satisfied the FLAC stage, so we continue to the
+            // next ARL instead of selecting it prematurely.
+            const actualFormat = String(
+              resolved.format || requestedProfile.format
+            ).toUpperCase();
+
+            const actualKey = actualFormat === "FLAC"
+              ? "flac"
+              : actualFormat === "MP3_320"
+                ? "320"
+                : actualFormat === "MP3_128"
+                  ? "128"
+                  : null;
+
+            if (!actualKey) {
+              throw new Error(`Unsupported media format returned by Deezer: ${actualFormat}`);
+            }
+
+            if (actualKey !== requestedKey) {
+              throw new Error(
+                `Deezer returned ${actualFormat} for requested ${requestedProfile.format}`
+              );
+            }
+
+            const actualProfile = QUALITY_MAP[actualKey];
+
+            arl = candidateArl;
+            session = candidateSession;
+            selectedArlSlot = candidate.slot;
+            selectedArlTier = actualProfile.lossless ? "lossless" : "lossy";
+            trackData = candidateTrackData;
+            mediaResult = resolved;
+            selectedProfile = actualProfile;
+            selected = true;
+            break;
+          } catch (err) {
+            lastMediaError = err;
+            // Keep the ARL available for the next quality stage. A failed FLAC
+            // authorization does NOT mean the ARL itself is dead because the
+            // same account may still be perfectly valid for MP3_128.
           }
-          return Response.redirect(data.streamUrl, 302);
         }
-
-        return jsonResponse(data, 200, {
-          "Cache-Control": "no-store",
-          "X-Qobuz-Token": String(data.token_slot || "unknown"),
-          "X-Qobuz-Format": String(data.format_id || "unknown"),
-          "X-Qobuz-Cache": data.diagnostics?.cache?.stream || "miss",
-          "Server-Timing": `total;dur=${data.diagnostics?.elapsed_ms || 0}`,
-        });
       }
 
-      if (path === "/search") {
-        const data = await routeSearch(env, url);
-        const response = jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=30",
-        });
-        return request.method === "HEAD" ? headResponse(response) : response;
+      if (!trackData?.TRACK_TOKEN || !mediaResult || !selectedProfile) {
+        throw lastMediaError || new Error("All configured Deezer ARLs failed to resolve the track.");
       }
 
-      if (path === "/album") {
-        const data = await routeAlbum(env, url, ctx);
-        const response = jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=60",
-        });
-        return request.method === "HEAD" ? headResponse(response) : response;
+      const songId = String(trackData.SNG_ID || track.id);
+      const cleanStreamUrl = `${requestUrl.origin}/stream?id=${songId}&format=${mediaResult.format}&url=${encodeURIComponent(mediaResult.directCdnUrl)}`;
+
+      // Immediate redirect if stream=1
+      if (requestUrl.searchParams.get("stream") === "1" && !requestUrl.searchParams.has("json")) {
+        return Response.redirect(cleanStreamUrl, 302);
       }
 
-      if (path === "/artist") {
-        const data = await routeArtist(env, url, ctx);
-        const response = jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=60",
-        });
-        return request.method === "HEAD" ? headResponse(response) : response;
+      // Optional Features: Lyrics and Autoplay
+      const wantLyrics = requestUrl.searchParams.has("lyrics") || routePath === "/lyrics";
+      const wantRadio = requestUrl.searchParams.has("radio") || requestUrl.searchParams.has("autoplay") || routePath === "/radio";
+      const wantDebug = requestUrl.searchParams.has("debug");
+
+      const artistId = String(trackData.ART_ID || track.artist?.id);
+
+      // Parallel feature retrieval
+      const [pipeLyrics, radioTracks, albumData] = await Promise.all([
+        wantLyrics ? getLyricsFromPipeGQL(arl, songId) : Promise.resolve(null),
+        wantRadio ? getAutoplayRadio(artistId, songId, requestUrl.origin, rawQuality) : Promise.resolve(null),
+        getAlbumMetadata(trackData.ALB_ID || track.album?.id),
+      ]);
+
+      // Fallback to LRCLIB if Deezer GraphQL has no lyrics
+      let finalLyrics = pipeLyrics;
+      if (wantLyrics && (!finalLyrics || !finalLyrics.plain || !finalLyrics.lrc)) {
+        const fallback = await getLyricsFromLRCLIB(
+          trackData.SNG_TITLE || track.title,
+          trackData.ART_NAME || track.artist?.name,
+          toNumber(trackData.DURATION) ?? toNumber(track.duration),
+          trackData.ISRC || track.isrc
+        );
+        if (fallback) {
+          if (!finalLyrics) {
+            finalLyrics = fallback;
+          } else {
+            finalLyrics = {
+              ...fallback,
+              ...finalLyrics,
+              plain: finalLyrics.plain || fallback.plain,
+              lrc: finalLyrics.lrc || fallback.lrc,
+              writers: finalLyrics.writers || fallback.writers,
+              copyright: finalLyrics.copyright || fallback.copyright,
+            };
+          }
+        }
       }
 
-      if (path === "/playlist") {
-        const data = await routePlaylist(env, url, ctx);
-        const response = jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=30",
-        });
-        return request.method === "HEAD" ? headResponse(response) : response;
+      // Direct route endpoints
+      if (routePath === "/lyrics") {
+        return jsonResponse({ track_id: songId, lyrics: finalLyrics });
+      }
+      if (routePath === "/radio") {
+        return jsonResponse({ track_id: songId, radio: radioTracks });
       }
 
-      if (path === "/cover") {
-        const data = await routeCover(env, url);
-        const response = jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=86400",
-        });
-        return request.method === "HEAD" ? headResponse(response) : response;
+      // Artwork generators
+      const albumArtwork = buildArtworkUrls(trackData.ALB_PICTURE || track.album?.cover_xl || track.album?.cover, "cover");
+      const artistArtwork = buildArtworkUrls(trackData.ART_PICTURE || track.artist?.picture_xl || track.artist?.picture, "artist");
+
+      const richMetadata = buildRichMetadata(trackData, track, albumData, finalLyrics);
+      const version = firstValue(
+        trackData.VERSION,
+        trackData.SNG_VERSION,
+        trackData.TRACK_VERSION,
+        trackData.version,
+        track.version
+      );
+      const bpm = toNumber(firstValue(
+        track.bpm,
+        trackData.BPM,
+        trackData.SNG_BPM,
+        trackData.TRACK_BPM,
+        trackData.bpm
+      ));
+
+      // Final rich JSON response
+      const responsePayload = {
+        provider: "deezer",
+        id: songId,
+        isrc: trackData.ISRC || track.isrc || null,
+        title: trackData.SNG_TITLE || track.title,
+        version,
+        duration: Number(trackData.DURATION) || track.duration || null,
+        track_number: Number(trackData.TRACK_NUMBER) || track.track_position || null,
+        disc_number: Number(trackData.DISK_NUMBER) || track.disk_number || null,
+        bpm,
+        gain: trackData.GAIN ? parseFloat(trackData.GAIN) : null,
+        explicit: Boolean(Number(trackData.EXPLICIT_LYRICS) || track.explicit_lyrics),
+        release_date: trackData.PHYSICAL_RELEASE_DATE || track.release_date || null,
+
+        // High quality artwork suite (up to 1900x1900)
+        artwork: albumArtwork,
+
+        artist: {
+          id: artistId,
+          name: trackData.ART_NAME || track.artist?.name || "Unknown",
+          artwork: artistArtwork,
+        },
+
+        album: {
+          id: String(trackData.ALB_ID || track.album?.id),
+          title: trackData.ALB_TITLE || track.album?.title || null,
+          release_date: track.album?.release_date || trackData.PHYSICAL_RELEASE_DATE || null,
+          track_count: toNumber(firstValue(
+            albumData?.nb_tracks,
+            trackData?.ALB_NB_TRACKS,
+            trackData?.ALBUM_NB_TRACKS,
+            track?.album?.nb_tracks
+          )),
+          artwork: albumArtwork,
+        },
+
+        // Audio specifications
+        audio: {
+          format: selectedProfile.audioFormat,           // "FLAC" or "MP3"
+          bitrate: selectedProfile.bitrate,               // 320, 128, or null
+          sampleRate: selectedProfile.sampleRate,         // 44100
+          bitDepth: selectedProfile.bitDepth,             // 16 or null
+          lossless: selectedProfile.lossless,             // true / false
+          audioQuality: selectedProfile.badge,            // "LOSSLESS", "HIGH", or "LOW"
+          qualityLabel: selectedProfile.label,
+          mimeType: selectedProfile.mime,
+          rawProfile: mediaResult.format,
+        },
+
+        // Top-level aliases
+        format: selectedProfile.audioFormat,
+        bitrate: selectedProfile.bitrate,
+        sampleRate: selectedProfile.sampleRate,
+        bitDepth: selectedProfile.bitDepth,
+        audioQuality: selectedProfile.badge,
+        quality: selectedProfile.label,
+        deliveredQuality: selectedProfile.audioFormat === "FLAC" ? "16-bit / 44.1kHz" : selectedProfile.label,
+
+        contributors: richMetadata.contributors,
+        writers: richMetadata.writers,
+        copyright: richMetadata.copyright,
+        label: richMetadata.label,
+        distributor: richMetadata.distributor,
+        publisher: richMetadata.publisher,
+        authorsNotes: richMetadata.authorsNotes,
+        credits: richMetadata.rawCredits,
+
+        deezerAccount: {
+          variable: selectedArlSlot === 1 ? "DEEZER_ARL" : `DEEZER_ARL_${selectedArlSlot}`,
+          slot: selectedArlSlot,
+          tier: selectedArlTier,
+          canLossless: Boolean(selectedProfile?.lossless),
+        },
+
+        sourceMetadata: sanitizeSourceMetadata(trackData),
+        streamUrl: cleanStreamUrl,
+        rawCdnUrl: mediaResult.directCdnUrl,
+      };
+
+      if (wantLyrics) {
+        responsePayload.lyrics = finalLyrics;
       }
 
-      if (path === "/lyrics") {
-        const response = await routeLyrics(env, url);
-        return response;
+      if (wantRadio) {
+        responsePayload.radio = radioTracks;
       }
 
-      if (path === "/recommendations") {
-        const data = await routeRecommendations(env, url);
-        if (data instanceof Response) return data;
-        return jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=60",
-        });
+      if (wantDebug) {
+        responsePayload.debug = {
+          session: {
+            canLossless: session.canLossless,
+            jwtActive: Boolean(jwtCache.get(arl)?.jwt),
+            tokenExpiry: new Date(session.expiresAt).toISOString(),
+          },
+          metadataSources: {
+            restTrack: Boolean(track),
+            trackBpm: track?.bpm ?? null,
+            trackContributors: Array.isArray(track?.contributors) ? track.contributors.length : 0,
+            albumMetadata: Boolean(albumData),
+            pipeLyrics: Boolean(pipeLyrics),
+          },
+          serverAvailableFormats: {
+            flac: Number(trackData.FILESIZE_FLAC) > 0,
+            mp3_320: Number(trackData.FILESIZE_MP3_320) > 0,
+            mp3_128: Number(trackData.FILESIZE_MP3_128) > 0,
+          },
+          filesizes: {
+            flac: Number(trackData.FILESIZE_FLAC) || 0,
+            mp3_320: Number(trackData.FILESIZE_MP3_320) || 0,
+            mp3_128: Number(trackData.FILESIZE_MP3_128) || 0,
+          },
+        };
       }
 
-      if (path === "/radio") {
-        const data = await routeRadio(env, url);
-        return jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=30",
-        });
-      }
-
-      if (path === "/artist/similar") {
-        const data = await routeSimilarArtist(env, url);
-        return jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=300",
-        });
-      }
-
-      if (path === "/album/similar") {
-        const data = await routeAlbumSimilar(env, url);
-        if (data instanceof Response) return data;
-        return jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=300",
-        });
-      }
-
-      if (path === "/chart") {
-        const data = await routeChart(env, url);
-        return jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=60",
-        });
-      }
-
-      if (path === "/genre") {
-        const data = await routeGenre(env, url);
-        return jsonResponse(data, 200, {
-          "Cache-Control": "public, max-age=300",
-        });
-      }
-
-      return apiError("Not found", 404, {
-        available: rootInfo(env).endpoints,
-      });
+      return jsonResponse(responsePayload);
     } catch (error) {
-      const status =
-        Number(error?.status) >= 400 && Number(error?.status) < 600
-          ? Number(error.status)
-          : 502;
-
-      return apiError(
-        error?.message || "Qobuz request failed",
-        status,
+      return jsonResponse(
         {
-          attempts: error?.attempts || error?.tokenErrors || undefined,
-        }
+          error: "Deezer media resolution failed",
+          message: error.message,
+        },
+        502
       );
     }
   },
 };
+
+export default worker;a
