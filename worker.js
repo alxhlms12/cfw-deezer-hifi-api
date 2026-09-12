@@ -2116,4 +2116,4 @@ const worker = {
   },
 };
 
-export default worker;a
+export default worker;
