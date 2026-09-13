@@ -12,7 +12,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.4.25";
+const API_VERSION = "1.4.27";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -125,6 +125,8 @@ const clientApiKeyHashCache = new BoundedMap(128);
 const clientUserAgentHashCache = new BoundedMap(64);
 const mediaInflight = new BoundedMap(256);
 const trackTokenInflight = new BoundedMap(256);
+const trackTokenCache = new BoundedMap(512);
+const sessionInflight = new BoundedMap(128);
 const catalogInflight = new BoundedMap(128);
 const GENERAL_CACHE_PREFIX = "music:deezer:";
 
@@ -984,7 +986,7 @@ function getSafeChunkSize(requestUrl, env) {
 
 
 
-async function getOrRenewSession(arl, env = null, forceRefresh = false) {
+async function getOrRenewSessionUncached(arl, env = null, forceRefresh = false) {
   const licenseTtlMinutes = Math.max(10, Math.min(55, Number(env?.LICENSE_TOKEN_TTL_MINUTES) || 45));
   if (!forceRefresh) {
     const cached = sessionCache.get(arl);
@@ -1049,6 +1051,20 @@ async function getOrRenewSession(arl, env = null, forceRefresh = false) {
   const ttlHours = Number(env?.SESSION_TTL_HOURS) || 2;
   sessionCache.set(arl, session, 1000 * 60 * 60 * ttlHours);
   return session;
+}
+
+
+async function getOrRenewSession(arl, env = null, forceRefresh = false) {
+  const cleanArl = String(arl || "").trim();
+  if (!cleanArl) throw new Error("Missing Deezer ARL");
+  const key = `${cleanArl}|${forceRefresh ? "force" : "normal"}`;
+  const pending = sessionInflight.get(key);
+  if (pending) return pending;
+
+  const promise = getOrRenewSessionUncached(cleanArl, env, forceRefresh);
+  sessionInflight.set(key, promise, 10000);
+  promise.finally(() => sessionInflight.delete(key)).catch(() => {});
+  return promise;
 }
 
 async function getCandidatePools(env, allowedSlots = null) {
@@ -1814,21 +1830,31 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
   }
 
   if (primaryArl) {
-    // Normal case: one cached-JWT Pipe request. If Pipe has usable lyrics,
-    // return immediately. Do not make a second request just to compare APIs.
-    const pipeLyrics = await getLyricsFromPipeGQL(primaryArl, songId, env);
-    if (hasUsableDeezerLyrics(pipeLyrics)) {
-      lyricsMemoryCache.set(songId, pipeLyrics, 1000 * 60 * 60 * 2);
-      await putSharedCache(env, cacheKey, pipeLyrics, 86400 * 30);
-      return pipeLyrics;
-    }
+    // Race the two private Deezer lyrics surfaces instead of waiting for one
+    // to fail before starting the other. Pipe can provide word-sync; the
+    // gateway is often faster for line-sync/plain lyrics. First usable result
+    // wins, which keeps lyrics from becoming a serial latency tax.
+    const sessionPromise = primarySession
+      ? Promise.resolve(primarySession)
+      : getOrRenewSession(primaryArl, env).catch(() => null);
+    const pipePromise = getLyricsFromPipeGQL(primaryArl, songId, env);
+    const gwPromise = sessionPromise.then(session => getLyricsFromGwLight(session, songId, env));
 
-    // Fallback: the gateway can still provide lyrics when Pipe is unavailable.
-    const gwLyrics = await getLyricsFromGwLight(primarySession, songId, env);
-    if (hasUsableDeezerLyrics(gwLyrics)) {
-      lyricsMemoryCache.set(songId, gwLyrics, 1000 * 60 * 60 * 2);
-      await putSharedCache(env, cacheKey, gwLyrics, 86400 * 30);
-      return gwLyrics;
+    const racedLyrics = await Promise.any([
+      pipePromise.then(value => {
+        if (!hasUsableDeezerLyrics(value)) throw new Error("Pipe lyrics unavailable");
+        return value;
+      }),
+      gwPromise.then(value => {
+        if (!hasUsableDeezerLyrics(value)) throw new Error("Gateway lyrics unavailable");
+        return value;
+      }),
+    ]).catch(() => null);
+
+    if (hasUsableDeezerLyrics(racedLyrics)) {
+      lyricsMemoryCache.set(songId, racedLyrics, 1000 * 60 * 60 * 2);
+      await putSharedCache(env, cacheKey, racedLyrics, 86400 * 30);
+      return racedLyrics;
     }
   }
 
@@ -1917,13 +1943,25 @@ async function getTrackTokensUncached(arl, session, trackId) {
   return trackData;
 }
 
+function getTrackTokenCacheTtlMs(env = null) {
+  const value = Number(env?.TRACK_TOKEN_CACHE_TTL_MS);
+  if (!Number.isFinite(value) || value <= 0) return 30000;
+  return Math.max(5000, Math.min(120000, Math.floor(value)));
+}
+
 async function getTrackTokens(arl, session, trackId, env = null) {
   const key = `${String(arl)}|${String(session?.sid || "")}|${String(trackId)}`;
+  const cached = trackTokenCache.get(key);
+  if (cached?.TRACK_TOKEN) return cached;
+
   let pending = trackTokenInflight.get(key);
   if (pending) return pending;
+
   pending = getTrackTokensUncached(arl, session, trackId);
   trackTokenInflight.set(key, pending, getTrackTokenInflightTtlMs(env));
-  pending.finally(() => trackTokenInflight.delete(key)).catch(() => {});
+  pending.then(result => {
+    if (result?.TRACK_TOKEN) trackTokenCache.set(key, result, getTrackTokenCacheTtlMs(env));
+  }).catch(() => {}).finally(() => trackTokenInflight.delete(key)).catch(() => {});
   return pending;
 }
 
@@ -2062,121 +2100,141 @@ async function resolvePlaybackStreamOnly(trackId, rawQuality, env, allowedSlots 
   const pools = await getCandidatePools(env, allowedSlots);
   const formatLadder = getFormatLadder(rawQuality, env);
   const isRandomStrategy = (env?.LOAD_BALANCING_STRATEGY || "random").toLowerCase().trim() !== "sequential";
+  const configuredConcurrency = Number(env?.RESOLUTION_CONCURRENCY);
+  const concurrency = Number.isFinite(configuredConcurrency) && configuredConcurrency > 0
+    ? Math.max(1, Math.min(10, Math.floor(configuredConcurrency)))
+    : 5;
 
-  let selectedResult = null;
   let lastError = null;
 
-  for (const targetFormat of formatLadder) {
-    if (selectedResult) break;
+  async function tryCandidate(candidate, targetFormat) {
+    try {
+      if (!candidate.session) {
+        candidate.session = await getOrRenewSession(candidate.arl, env);
+      }
 
-    let targetCandidates = [];
+      if (targetFormat === "FLAC" && candidate.session.canLossless === false) return null;
+      if (targetFormat === "MP3_320" && candidate.session.can320 === false) return null;
+
+      if (!candidate.trackTokens) {
+        candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId, env);
+        if (!candidate.trackTokens?.TRACK_TOKEN) {
+          candidate.session = await getOrRenewSession(candidate.arl, env, true);
+          candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId, env);
+        }
+      }
+
+      let candidateTrackData = candidate.trackTokens;
+      if (!candidateTrackData?.TRACK_TOKEN) return null;
+      if (targetFormat === "FLAC" && candidateTrackData.FILESIZE_FLAC === "0") return null;
+
+      let resolved;
+      let mediaError = null;
+      const retryCount = getMediaRetryCount(env);
+
+      for (let mediaAttempt = 0; mediaAttempt <= retryCount; mediaAttempt++) {
+        try {
+          resolved = await resolveMediaStream(
+            candidate.session.licenseToken,
+            candidateTrackData.TRACK_TOKEN,
+            targetFormat,
+            env,
+          );
+          mediaError = null;
+          break;
+        } catch (err) {
+          mediaError = err;
+          const canReauth = mediaAttempt < retryCount && isMediaAuthFailure(err);
+          if (!canReauth) break;
+          try {
+            candidateTrackData = await refreshCandidateForMedia(candidate, trackId, env);
+          } catch (refreshError) {
+            mediaError = refreshError;
+            break;
+          }
+        }
+      }
+
+      if (!resolved) throw mediaError || new Error(`Media resolution for ${targetFormat} failed`);
+
+      const actualFormat = String(resolved.format || targetFormat).toUpperCase();
+      const actualKey = actualFormat === "FLAC" ? "flac" : actualFormat === "MP3_320" ? "320" : "128";
+
+      if (actualFormat === "FLAC") {
+        candidate.session.canLossless = true;
+        candidate.session.can320 = true;
+      } else if (actualFormat === "MP3_320") {
+        candidate.session.can320 = true;
+      }
+
+      return {
+        arl: candidate.arl,
+        slot: candidate.slot,
+        session: candidate.session,
+        trackData: candidateTrackData,
+        mediaResult: resolved,
+        selectedProfile: QUALITY_MAP[actualKey] || QUALITY_MAP["128"],
+        trackId: candidateTrackData.SNG_ID || trackId,
+        pools,
+      };
+    } catch (err) {
+      if (candidate.session) {
+        if (targetFormat === "FLAC" && /rights|license|403|2002/i.test(err?.message || "")) {
+          candidate.session.canLossless = false;
+        } else if (targetFormat === "MP3_320" && /rights|license|403|2002/i.test(err?.message || "")) {
+          candidate.session.can320 = false;
+          candidate.session.canLossless = false;
+        }
+      }
+      lastError = err;
+      return null;
+    }
+  }
+
+  for (const targetFormat of formatLadder) {
+    let activeCandidates = [];
+    let unverifiedCandidates = [];
+
     if (targetFormat === "FLAC" || targetFormat === "MP3_320") {
-      if (!pools.lossless.length && !pools.unverified.length) continue;
-      const pool = [...pools.lossless, ...pools.unverified];
-      targetCandidates = isRandomStrategy ? shuffleArray(pool) : pool;
+      activeCandidates = [...(pools.lossless || [])];
+      unverifiedCandidates = [...(pools.unverified || [])];
     } else {
-      const lossyPart = isRandomStrategy ? shuffleArray(pools.lossy) : [...pools.lossy];
-      const losslessPart = isRandomStrategy ? shuffleArray(pools.lossless) : [...pools.lossless];
-      targetCandidates = [...lossyPart, ...losslessPart, ...pools.unverified];
+      activeCandidates = [...(pools.lossy || []), ...(pools.lossless || [])];
+      unverifiedCandidates = [...(pools.unverified || [])];
     }
 
-    for (const candidate of targetCandidates) {
+    if (isRandomStrategy) {
+      activeCandidates = shuffleArray(activeCandidates);
+      unverifiedCandidates = shuffleArray(unverifiedCandidates);
+    }
+
+    // Race authenticated and cold ARLs together. Previously the resolver
+    // exhausted the warm pool before even touching unverified ARLs, which made
+    // one slow/broken session turn into a long serial fallback chain. The
+    // concurrency cap still prevents an uncontrolled 50-ARL request storm.
+    const candidates = [...activeCandidates, ...unverifiedCandidates];
+    if (!candidates.length) continue;
+
+    // Promise.any gives us the first successful Deezer media resolution.
+    // The requested format remains authoritative, so formats themselves are
+    // still processed in quality order. Within a format, however, ARLs race.
+    for (let i = 0; i < candidates.length; i += concurrency) {
+      const batch = candidates.slice(i, i + concurrency);
+      const races = batch.map(async candidate => {
+        const result = await tryCandidate(candidate, targetFormat);
+        if (!result) throw new Error("candidate failed");
+        return result;
+      });
       try {
-        if (!candidate.session) {
-          candidate.session = await getOrRenewSession(candidate.arl, env);
-        }
-
-        if (targetFormat === "FLAC" && candidate.session.canLossless === false) continue;
-        if (targetFormat === "MP3_320" && candidate.session.can320 === false) continue;
-
-        if (!candidate.trackTokens) {
-          candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId, env);
-          if (!candidate.trackTokens?.TRACK_TOKEN) {
-            candidate.session = await getOrRenewSession(candidate.arl, env, true);
-            candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId, env);
-          }
-        }
-
-        let candidateTrackData = candidate.trackTokens;
-        if (!candidateTrackData?.TRACK_TOKEN) continue;
-
-        if (targetFormat === "FLAC" && candidateTrackData.FILESIZE_FLAC === "0") {
-          continue;
-        }
-
-        let resolved;
-        let mediaError = null;
-        const retryCount = getMediaRetryCount(env);
-
-        for (let mediaAttempt = 0; mediaAttempt <= retryCount; mediaAttempt++) {
-          try {
-            resolved = await resolveMediaStream(
-              candidate.session.licenseToken,
-              candidateTrackData?.TRACK_TOKEN,
-              targetFormat,
-              env,
-            );
-            mediaError = null;
-            break;
-          } catch (err) {
-            mediaError = err;
-            const canReauth = mediaAttempt < retryCount && isMediaAuthFailure(err);
-            if (!canReauth) break;
-
-            try {
-              candidateTrackData = await refreshCandidateForMedia(candidate, trackId, env);
-            } catch (refreshError) {
-              mediaError = refreshError;
-              break;
-            }
-          }
-        }
-
-        if (!resolved) throw mediaError || new Error(`Media resolution for ${targetFormat} failed`);
-
-        const actualFormat = String(resolved.format || targetFormat).toUpperCase();
-        const actualKey = actualFormat === "FLAC" ? "flac" : actualFormat === "MP3_320" ? "320" : "128";
-
-        if (actualFormat === "FLAC") {
-          candidate.session.canLossless = true;
-          candidate.session.can320 = true;
-        } else if (actualFormat === "MP3_320") {
-          candidate.session.can320 = true;
-        }
-
-        selectedResult = {
-          arl: candidate.arl,
-          slot: candidate.slot,
-          session: candidate.session,
-          trackData: candidateTrackData,
-          mediaResult: resolved,
-          selectedProfile: QUALITY_MAP[actualKey] || QUALITY_MAP["128"],
-          trackId: candidateTrackData.SNG_ID || trackId,
-          pools,
-        };
-        break;
-      } catch (err) {
-        if (candidate.session) {
-          if (targetFormat === "FLAC" && /rights|license|403|2002/i.test(err?.message || "")) {
-            candidate.session.canLossless = false;
-          } else if (targetFormat === "MP3_320" && /rights|license|403|2002/i.test(err?.message || "")) {
-            candidate.session.can320 = false;
-            candidate.session.canLossless = false;
-          }
-        }
-        lastError = err;
+        return await Promise.any(races);
+      } catch (_) {
+        // Every candidate in this batch failed. Launch the next batch.
       }
     }
   }
 
-  if (!selectedResult) {
-    throw lastError || new Error("All configured Deezer ARLs failed to resolve playback stream");
-  }
-
-  return selectedResult;
+  throw lastError || new Error("All configured Deezer ARLs failed to resolve playback stream");
 }
-
-
 
 
 async function discoverTrack({ id, isrc, query, title, artist }, env = null, allowAlt = false, preferExplicit = true) {
