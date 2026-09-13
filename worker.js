@@ -1,4 +1,5 @@
-// cfw-deezer-hifi-api-v1.4.23-optimized
+// cfw-deezer-hifi-api-v1.4.28
+// Secure instance-to-instance ARL federation added on top of the v1.4.27 racing/latency pass.
 // Playback fix: /stream Range requests bypass the generic API rate limiter so continuous audio cannot be interrupted by 429 responses.
 // Playback hardening: authenticated playback entry points require signed
 // bootstrap tokens by default; tokens remain reusable until their normal expiry.
@@ -12,7 +13,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.4.27";
+const API_VERSION = "1.4.28";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -128,6 +129,12 @@ const trackTokenInflight = new BoundedMap(256);
 const trackTokenCache = new BoundedMap(512);
 const sessionInflight = new BoundedMap(128);
 const catalogInflight = new BoundedMap(128);
+
+// Secure instance-to-instance ARL sharing runtime state. Shared ARLs are never
+// emitted by diagnostics and never placed in URLs.
+const arlShareRuntime = new WeakMap();
+const ARL_SHARE_CACHE_PREFIX = "arl-share:v1:";
+
 const GENERAL_CACHE_PREFIX = "music:deezer:";
 
 function sharedCacheKey(type, id) {
@@ -382,6 +389,15 @@ function getMemoizedConfig(env) {
     const name = i === 1 ? (env.DEEZER_ARL ? "DEEZER_ARL" : "DEEZER_ARL_1") : `DEEZER_ARL_${i}`;
     const value = env[name]?.trim() || (i === 1 ? env.DEEZER_ARL_1?.trim() : undefined);
     if (value) arls.push({ slot: i, name, value });
+  }
+
+  const sharedState = arlShareRuntime.get(env);
+  if (sharedState?.arls?.length) {
+    for (const shared of sharedState.arls) {
+      if (!shared?.value) continue;
+      if (arls.some(item => item.value === shared.value)) continue;
+      arls.push(shared);
+    }
   }
 
   const mappings = new Map();
@@ -1075,7 +1091,8 @@ async function getCandidatePools(env, allowedSlots = null) {
 
   let configured = arls;
   if (allowedSlots && allowedSlots.size > 0) {
-    configured = configured.filter(c => allowedSlots.has(c.slot));
+    const allowShared = envBoolean(env, "ARL_SHARE_ACCESS", false);
+    configured = configured.filter(c => c.shared ? allowShared : allowedSlots.has(c.slot));
     if (!configured.length) {
       throw new Error("No active ARL slots match the permissions of your API key.");
     }
@@ -4137,6 +4154,251 @@ function getPresentedApiToken(request, env) {
 
 const STREAM_TOKEN_SECURITY_NOTE = "Bootstrap stream tokens use a fresh 256-bit cryptographically random nonce plus an HMAC-SHA-256 signed payload. Every emitted bootstrap URL gets a new nonce and token generation is never coalesced. Authenticated playback entry points can require a valid signed bootstrap token by default. DEVICE_BOUND_SIGNED_STREAMS adds a long-lived signed device credential and binds playback sessions/tokens to its hash, so copied stream URLs are not independently playable.";
 
+// -----------------------------------------------------------------------------
+// Secure instance-to-instance ARL sharing
+// -----------------------------------------------------------------------------
+function getArlShareSecret(env) {
+  return String(env?.ARL_SHARE_SECRET || "").trim();
+}
+
+function normalizeInstanceUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    const local = ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
+    if (url.protocol !== "https:" && !(local && url.protocol === "http:")) return null;
+    return url.origin;
+  } catch (_) {
+    return null;
+  }
+}
+
+function parseArlShareSlots(env) {
+  return String(env?.GET_ARL || "")
+    .split(",")
+    .map(v => Number.parseInt(v.trim(), 10))
+    .filter(v => Number.isInteger(v) && v >= 1 && v <= 50)
+    .filter((v, i, a) => a.indexOf(v) === i);
+}
+
+function getArlShareSenderUrl(env) { return normalizeInstanceUrl(env?.GET_ARL_SENDER_URL); }
+function getArlShareReceiverUrl(env) { return normalizeInstanceUrl(env?.GET_ARL_RECEIVER_URL); }
+function arlShareConfigured(env) { return Boolean(getArlShareSecret(env) && (getArlShareSenderUrl(env) || getArlShareReceiverUrl(env))); }
+
+async function arlShareStableCacheKey(env, receiverUrlOverride = null) {
+  const sender = getArlShareSenderUrl(env) || "none";
+  const receiver = normalizeInstanceUrl(receiverUrlOverride) || getArlShareReceiverUrl(env) || "none";
+  return `${ARL_SHARE_CACHE_PREFIX}${await sha256Hex(`${sender}|${receiver}`)}`;
+}
+
+async function getArlShareCryptoKey(env, usage) {
+  const secret = getArlShareSecret(env);
+  if (!secret) return null;
+  const digest = await sha256Bytes(`cfw-deezer-hifi-api|arl-share|aes-gcm|v1|${secret}`);
+  return crypto.subtle.importKey("raw", digest, { name: "AES-GCM" }, false, usage);
+}
+
+async function arlShareSign(value, env) {
+  const secret = getArlShareSecret(env);
+  if (!secret) return null;
+  const key = await crypto.subtle.importKey("raw", await sha256Bytes(`cfw-deezer-hifi-api|arl-share|hmac|v1|${secret}`), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return base64UrlEncodeBytes(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value)));
+}
+
+async function arlShareVerify(value, signature, env) {
+  const secret = getArlShareSecret(env);
+  if (!secret || !signature) return false;
+  try {
+    const key = await crypto.subtle.importKey("raw", await sha256Bytes(`cfw-deezer-hifi-api|arl-share|hmac|v1|${secret}`), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+    return await crypto.subtle.verify("HMAC", key, base64UrlDecodeBytes(signature), new TextEncoder().encode(value));
+  } catch (_) { return false; }
+}
+
+async function encryptArlShare(payload, env) {
+  const key = await getArlShareCryptoKey(env, ["encrypt"]);
+  if (!key) throw new Error("ARL_SHARE_SECRET is not configured");
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aad = new TextEncoder().encode(`cfw-deezer-hifi-api|arl-share|${payload.nonce}|${payload.receiver_url}`);
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: aad }, key, new TextEncoder().encode(JSON.stringify(payload)));
+  return { v: 1, iv: base64UrlEncodeBytes(iv), data: base64UrlEncodeBytes(new Uint8Array(ciphertext)) };
+}
+
+async function decryptArlShare(envelope, expectedNonce, expectedReceiverUrl, env) {
+  const key = await getArlShareCryptoKey(env, ["decrypt"]);
+  if (!key) throw new Error("ARL_SHARE_SECRET is not configured");
+  if (!envelope || Number(envelope.v) !== 1) throw new Error("Invalid ARL share envelope");
+  const iv = base64UrlDecodeBytes(envelope.iv);
+  const data = base64UrlDecodeBytes(envelope.data);
+  if (iv.byteLength !== 12 || data.byteLength < 17 || data.byteLength > 256 * 1024) throw new Error("Invalid ARL share envelope size");
+  const aad = new TextEncoder().encode(`cfw-deezer-hifi-api|arl-share|${expectedNonce}|${expectedReceiverUrl}`);
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: aad }, key, data);
+  return JSON.parse(new TextDecoder().decode(plaintext));
+}
+
+function getArlShareState(env) {
+  let state = arlShareRuntime.get(env);
+  if (!state) {
+    state = { arls: [], loadedKeys: new Set(), syncing: null, lastSyncAt: 0, lastError: null, lastStatus: "not_configured", sourceUrl: null };
+    arlShareRuntime.set(env, state);
+  }
+  return state;
+}
+
+function setSharedArls(env, records, meta = {}) {
+  const state = getArlShareState(env);
+  const seen = new Set();
+  const normalized = [];
+  for (const record of Array.isArray(records) ? records : []) {
+    const value = String(record?.value || record?.arl || "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    normalized.push({ slot: 1000 + normalized.length + 1, name: `SHARED_ARL_${normalized.length + 1}`, value, shared: true, source: "instance", sourceUrl: String(meta.sourceUrl || ""), originSlot: Number(record?.slot) || null, importedAt: Date.now() });
+  }
+  state.arls = normalized;
+  state.lastSyncAt = Date.now();
+  state.lastError = null;
+  state.lastStatus = normalized.length ? "healthy" : "empty";
+  state.sourceUrl = String(meta.sourceUrl || state.sourceUrl || "") || null;
+  memoizedEnvRef = null; memoizedConfiguredArls = null; memoizedKeyMappings = null;
+  return normalized;
+}
+
+function clearSharedArls(env, reason = "revoked") {
+  const state = getArlShareState(env);
+  for (const item of state.arls) clearArlCache(item.value);
+  state.arls = [];
+  state.lastSyncAt = Date.now();
+  state.lastError = reason;
+  state.lastStatus = reason;
+  memoizedEnvRef = null; memoizedConfiguredArls = null; memoizedKeyMappings = null;
+}
+
+function getArlShareSyncTtlMs(env) {
+  const value = Number(env?.ARL_SHARE_SYNC_TTL_SECONDS);
+  if (!Number.isFinite(value) || value <= 0) return 30000;
+  return Math.max(5000, Math.min(3600000, Math.floor(value * 1000)));
+}
+
+async function persistSharedArls(env, records, sourceUrl, receiverUrl) {
+  if (!env?.GENERAL_MUSIC_CACHE) return;
+  try {
+    const key = await arlShareStableCacheKey(env, receiverUrl);
+    await env.GENERAL_MUSIC_CACHE.put(key, JSON.stringify({ v: 1, source_url: sourceUrl, records, stored_at: Date.now() }), { expirationTtl: Math.max(60, Math.ceil(getArlShareSyncTtlMs(env) / 1000) * 4) });
+  } catch (_) {}
+}
+
+async function loadPersistedSharedArls(env, receiverUrl) {
+  const state = getArlShareState(env);
+  const key = await arlShareStableCacheKey(env, receiverUrl);
+  if (state.loadedKeys.has(key)) return state;
+  state.loadedKeys.add(key);
+  if (!env?.GENERAL_MUSIC_CACHE || !getArlShareSenderUrl(env) || !getArlShareSecret(env)) return state;
+  try {
+    const cached = await env.GENERAL_MUSIC_CACHE.get(key, { type: "json" });
+    if (cached?.records?.length) setSharedArls(env, cached.records, { sourceUrl: cached.source_url || getArlShareSenderUrl(env) });
+  } catch (_) {}
+  return state;
+}
+
+function makeArlShareRequestMessage(timestamp, nonce, receiverUrl, senderUrl, fingerprint) {
+  return `v1|${timestamp}|${nonce}|${receiverUrl}|${senderUrl}|${fingerprint}`;
+}
+
+async function syncSharedArlsFromSender(env, receiverUrlOverride) {
+  const state = getArlShareState(env);
+  if (state.syncing) return state.syncing;
+  const senderUrl = getArlShareSenderUrl(env);
+  const receiverUrl = normalizeInstanceUrl(receiverUrlOverride);
+  const secret = getArlShareSecret(env);
+  if (!senderUrl || !receiverUrl || !secret) { state.lastStatus = "not_configured"; return state; }
+  state.syncing = (async () => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = await randomTokenNonce(32);
+    const fingerprint = await sha256Hex(receiverUrl);
+    const message = makeArlShareRequestMessage(timestamp, nonce, receiverUrl, senderUrl, fingerprint);
+    const signature = await arlShareSign(message, env);
+    try {
+      const url = new URL(senderUrl);
+      url.pathname = "/arl-share/request";
+      url.search = "";
+      url.searchParams.set("ts", String(timestamp));
+      url.searchParams.set("nonce", nonce);
+      url.searchParams.set("receiver", receiverUrl);
+      url.searchParams.set("sender", senderUrl);
+      url.searchParams.set("fingerprint", fingerprint);
+      const response = await fetch(url.toString(), { headers: { "Accept": "application/json", "X-ARL-Share-Signature": signature || "" }, cf: { cacheTtl: 0, cacheEverything: false } });
+      const body = await readResponse(response);
+      if (!response.ok) {
+        if (response.status === 403) clearSharedArls(env, body?.json?.code === "ARL_SHARE_REVOKED" ? "revoked" : "authorization_failed");
+        state.lastError = body?.json?.message || `sender_http_${response.status}`;
+        state.lastStatus = response.status === 403 ? "revoked" : "error";
+        return state;
+      }
+      const payload = await decryptArlShare(body.json, nonce, receiverUrl, env);
+      if (Number(payload?.v) !== 1 || payload?.nonce !== nonce || payload?.receiver_url !== receiverUrl || payload?.sender_url !== senderUrl) throw new Error("Sender response identity check failed");
+      const records = Array.isArray(payload?.arls) ? payload.arls : [];
+      setSharedArls(env, records, { sourceUrl: senderUrl });
+      await persistSharedArls(env, records, senderUrl, receiverUrl);
+      return state;
+    } catch (error) {
+      state.lastError = String(error?.message || error);
+      if (state.lastStatus !== "revoked") state.lastStatus = "error";
+      return state;
+    } finally { state.syncing = null; }
+  })();
+  return state.syncing;
+}
+
+async function maybeSyncSharedArls(env, ctx, force, receiverUrl) {
+  const state = await loadPersistedSharedArls(env, receiverUrl);
+  if (!getArlShareSenderUrl(env) || !getArlShareSecret(env) || !receiverUrl) return state;
+  const stale = !state.lastSyncAt || Date.now() - state.lastSyncAt >= getArlShareSyncTtlMs(env);
+  if (!force && !stale) return state;
+  if (state.arls.length && ctx?.waitUntil && !force) { ctx.waitUntil(syncSharedArlsFromSender(env, receiverUrl)); return state; }
+  return syncSharedArlsFromSender(env, receiverUrl);
+}
+
+async function handleArlShareRoute(request, env, requestUrl, requestId) {
+  const route = requestUrl.pathname.replace(/\/+$/, "") || "/";
+  const secret = getArlShareSecret(env);
+  const senderReceiverUrl = getArlShareReceiverUrl(env);
+  const receiverSenderUrl = getArlShareSenderUrl(env);
+  if (!secret) return publicError("ARL_SHARE_NOT_CONFIGURED", 404, env, requestId);
+
+  if (route === "/arl-share/sync") {
+    if (!receiverSenderUrl) return jsonResponse({ error: "ARL_SHARE_SENDER_NOT_CONFIGURED", message: "Set GET_ARL_SENDER_URL on this Worker first." }, 503, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
+    const state = await syncSharedArlsFromSender(env, requestUrl.origin);
+    return jsonResponse({ version: API_VERSION, status: state.lastStatus, shared: state.arls.length > 0, count: state.arls.length, source: receiverSenderUrl, last_sync_at: state.lastSyncAt || null, error: state.lastError || null }, state.lastStatus === "revoked" ? 403 : state.lastStatus === "error" ? 502 : 200, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
+  }
+
+  if (route !== "/arl-share/request") return publicError("NOT_FOUND", 404, env, requestId);
+  if (!parseArlShareSlots(env).length) return publicError("ARL_SHARE_SENDER_NOT_CONFIGURED", 503, env, requestId);
+  if (!senderReceiverUrl) return publicError("ARL_SHARE_REVOKED", 403, env, requestId);
+  const ts = Number(requestUrl.searchParams.get("ts"));
+  const nonce = String(requestUrl.searchParams.get("nonce") || "");
+  const requestedReceiver = normalizeInstanceUrl(requestUrl.searchParams.get("receiver"));
+  const requestedSender = normalizeInstanceUrl(requestUrl.searchParams.get("sender"));
+  const fingerprint = String(requestUrl.searchParams.get("fingerprint") || "");
+  const thisOrigin = requestUrl.origin;
+  if (!Number.isFinite(ts) || Math.abs(Math.floor(Date.now() / 1000) - ts) > 120) return publicError("ARL_SHARE_REQUEST_EXPIRED", 401, env, requestId);
+  if (!/^[a-f0-9]{64}$/.test(nonce) || !requestedReceiver || requestedReceiver !== senderReceiverUrl || requestedSender !== thisOrigin || fingerprint !== await sha256Hex(requestedReceiver)) return publicError("ARL_SHARE_IDENTITY_MISMATCH", 403, env, requestId);
+  const signature = request.headers.get("X-ARL-Share-Signature") || "";
+  const message = makeArlShareRequestMessage(ts, nonce, requestedReceiver, requestedSender, fingerprint);
+  if (!await arlShareVerify(message, signature, env)) return publicError("ARL_SHARE_AUTH_FAILED", 403, env, requestId);
+  const { arls } = getMemoizedConfig(env);
+  const slots = new Set(parseArlShareSlots(env));
+  const selected = arls.filter(item => slots.has(item.slot) && !item.shared).map(item => ({ slot: item.slot, value: item.value }));
+  if (!selected.length) return publicError("ARL_SHARE_NO_SELECTED_ARLS", 404, env, requestId);
+  const envelope = await encryptArlShare({ v: 1, nonce, receiver_url: requestedReceiver, sender_url: requestedSender, issued_at: Date.now(), arls: selected }, env);
+  return jsonResponse(envelope, 200, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
+}
+
+function arlShareStatus(env) {
+  const state = getArlShareState(env);
+  return { enabled: arlShareConfigured(env), sender: Boolean(getArlShareReceiverUrl(env) && parseArlShareSlots(env).length), receiver: Boolean(getArlShareSenderUrl(env)), configured_slots: parseArlShareSlots(env), imported_count: state.arls.length, shared: state.arls.length > 0, revokable: Boolean(getArlShareReceiverUrl(env)), sync_status: state.lastStatus, last_sync_at: state.lastSyncAt || null, last_error: state.lastError || null, source: state.sourceUrl };
+}
+
 const ENVIRONMENT_VARIABLES = {
   CORS_ALLOW_ORIGIN: "Allowed CORS origin; defaults to *.",
   PUBLIC_API: "Set true to disable API-key authentication for requests.",
@@ -4192,7 +4454,13 @@ const ENVIRONMENT_VARIABLES = {
   MAINTENANCE_MODE: "Set true to temporarily reject normal API/playback traffic with HTTP 503 while leaving the root status, /docs, and /env diagnostics available.",
   MAINTENANCE_MESSAGE: "Optional public maintenance message returned when MAINTENANCE_MODE=true. Defaults to Service temporarily unavailable for maintenance.",
   DISABLE_RECOMMENDATIONS: "Set true to disable /recommendations without disabling the rest of the catalog API.",
-  DISABLE_LYRICS: "Set true to disable standalone lyrics routes and embedded lyrics resolution. This can reduce auxiliary Deezer requests and ARL usage."
+  DISABLE_LYRICS: "Set true to disable standalone lyrics routes and embedded lyrics resolution. This can reduce auxiliary Deezer requests and ARL usage.",
+  GET_ARL: "Sender-side comma-separated local ARL slot numbers explicitly approved for instance sharing, e.g. 1,2,6. Empty/unset disables sending.",
+  GET_ARL_RECEIVER_URL: "Sender-side exact HTTPS origin of the one Worker allowed to receive GET_ARL. Removing or changing it revokes future synchronization.",
+  GET_ARL_SENDER_URL: "Receiver-side exact HTTPS origin of the one Worker authorized to send shared ARLs to this Worker.",
+  ARL_SHARE_SECRET: "Required shared secret for instance authentication and AES-GCM encryption. Set the same strong random secret on both Workers and store it as a Cloudflare Secret.",
+  ARL_SHARE_SYNC_TTL_SECONDS: "Receiver refresh interval for authorization/revocation checks. Defaults to 30 seconds; clamped to 5 seconds-1 hour.",
+  ARL_SHARE_ACCESS: "Set true to allow imported shared ARLs into normal candidate pools even when the caller API key is restricted to local slots. Defaults to false."
 };
 
 function diagnosticEnv(env) {
@@ -4365,6 +4633,8 @@ function buildDocs(requestUrl, env) {
         "/routing": "Public live routing, authentication, playback-security, timeout, route, and hardening configuration summary; no API key required.",
         "/env": "Admin-only non-secret environment diagnostics. Secret-like names/values are filtered and never exposed.",
         "/docs": "Public machine-readable documentation generated from the current Worker origin and environment configuration.",
+        "/arl-share/sync": "Receiver-side manual synchronization test. It authenticates to the configured sender, imports the encrypted ARL bundle, and reports the result without returning raw credentials.",
+        "/arl-share/request": "Sender-side internal handshake endpoint. It only responds to the exact receiver configured in GET_ARL_RECEIVER_URL and requires a valid ARL_SHARE_SECRET signature.",
         "/": "Credential-free instance identity/status response."
       }
     },
@@ -4393,6 +4663,25 @@ function buildDocs(requestUrl, env) {
         "npx wrangler secret put ADMIN_API_KEY"
       ],
       important_secret_rule: "Use Cloudflare Secrets for ARLs, API keys, and admin credentials. Do not put those values in wrangler vars or commit .dev.vars/.env files.",
+    },
+    arl_sharing: {
+      overview: "Two Workers can share explicitly selected ARLs without exposing them in public diagnostics or query strings. The sender selects slots with GET_ARL and names exactly one receiver. The receiver names exactly one sender. Both use the same ARL_SHARE_SECRET.",
+      sender: [
+        "Set GET_ARL=1,2,6 (only the local slots you intentionally want to share).",
+        "Set GET_ARL_RECEIVER_URL=https://receiver.example.workers.dev.",
+        "Create one strong random ARL_SHARE_SECRET and store it as a Cloudflare Secret. Use the identical secret on the receiver.",
+        "Deploy the sender."
+      ],
+      receiver: [
+        "Set GET_ARL_SENDER_URL=https://sender.example.workers.dev.",
+        "Set the identical ARL_SHARE_SECRET as the sender.",
+        "Bind GENERAL_MUSIC_CACHE if you want imported shared ARLs to survive Worker isolate restarts. Without it, the hot copy lasts only while the isolate remains warm.",
+        "Call /arl-share/sync once to test the relationship. After that, normal traffic refreshes authorization in the background every ARL_SHARE_SYNC_TTL_SECONDS."
+      ],
+      access: "When API keys are restricted to local slots, set ARL_SHARE_ACCESS=true on the receiver if those clients should also be allowed to use imported shared slots. Leave it false if shared ARLs should only be used by internal/default selection paths.",
+      revocation: "Remove or change GET_ARL_RECEIVER_URL on the sender. The receiver detects the 403 on its next synchronization and deletes its imported shared ARLs and their cached sessions. Lower ARL_SHARE_SYNC_TTL_SECONDS for faster revocation detection.",
+      security: "The receiver request is HMAC-authenticated with ARL_SHARE_SECRET and binds the exact sender/receiver origins plus a fresh nonce and timestamp. The selected ARLs are returned only inside an AES-GCM authenticated encrypted envelope. No raw ARL is returned by /routing, /docs, /ping, /env, or /arl-share/sync.",
+      diagnostics: "Use /arl-share/sync for a manual receiver test. Use /routing for configuration state and /ping for ARL health. Error states include not_configured, authorization_failed, revoked, request_expired, identity_mismatch, no_selected_arls, and synchronization errors."
     },
     quick_start: {
       private_api: [
@@ -4431,6 +4720,7 @@ function buildDocs(requestUrl, env) {
       similar_recommendations_isrc: `${origin}/recommendations?isrc=USUG11600920&limit=25`,
       device: `${origin}/device`,
       routing: `${origin}/routing`,
+      arl_share_sync: `${origin}/arl-share/sync`,
       test_routings: `${origin}/testRoutings?api_key=<configured-api-key>&track_id=920991742`,
       test_routing_alias: `${origin}/testRouting?api_key=<configured-api-key>&track_id=920991742`,
       lyrics: `${origin}/lyrics?id=3135556`,
@@ -4463,7 +4753,9 @@ function buildDocs(requestUrl, env) {
       "/recommendations": "Personalized Deezer recommendations by default. For song-based recommendations, provide id, q/query/s, isrc/i, title, and/or artist to resolve a seed and return similar tracks. Examples: /recommendations?id=3135556, /recommendations?q=Starboy%20The%20Weeknd, /recommendations?isrc=USUG11600920. user_id is retained only for personalized mode and cannot be combined with song-based recommendations. Recommendation tracks include streamUrl.",
       "/lyrics": "Lyrics lookup for a track id. The Worker uses native Deezer lyrics sources and can return word-level data when Deezer provides it.",
       "/cover": "Build normalized artwork URLs from an artwork hash/URL, or resolve artwork from a track id, ISRC, query, or artist id.",
-      "/ping": "Tests configured Deezer ARL slots and reports active/failed state and detected quality capability. Useful immediately after deployment.",
+      "/ping": "Tests configured Deezer ARL slots and reports active/failed state and detected quality capability. Shared imported slots are included in instance health when available.",
+      "/arl-share/sync": "Receiver-only manual synchronization endpoint. It performs the authenticated encrypted sender handshake and reports shared count/status without returning ARL values.",
+      "/arl-share/request": "Sender-side handshake endpoint. It accepts only the exact GET_ARL_RECEIVER_URL and a valid ARL_SHARE_SECRET signature, then returns an encrypted ARL bundle.",
       "/device": "Registers a cryptographically signed device credential when DEVICE_BOUND_SIGNED_STREAMS=true. Native clients should store device_token securely and send X-Voria-Device. Browsers can use the HttpOnly __Host-VoriaDevice cookie automatically set by /device. Refresh /device if the signing secret/credential is rotated or the browser no longer has a valid device cookie. If ALLOW_QUERY_DEVICE_SIGN=true, raw d1 credentials may be supplied as ?device_credential= for testing. Generated streamUrl values never contain the long-lived d1 credential.",
       "/routing": "Public, rate-limited routing/security diagnostics. No API key is required because it reports configuration shape and limits, not credential values. It reports device-bound signing state, playback URL authorization, diagnostic aliases, and supported HTTP methods.",
       "/env": "Admin-only environment diagnostics. Values matching secret-like names are intentionally hidden. Requires ADMIN_API_KEY directly; normal API_KEY is not required.",
@@ -4503,7 +4795,7 @@ function buildDocs(requestUrl, env) {
     bindings: {
       GENERAL_MUSIC_CACHE: "Create a Cloudflare KV namespace and bind it to the Worker under exactly the name GENERAL_MUSIC_CACHE if shared catalog/search/lyrics caching is desired.",
       RATE_LIMITER: "Bind a Cloudflare Rate Limiting binding under exactly the name RATE_LIMITER if distributed rate limiting is desired. The Worker calls its limit({ key }) method.",
-      secrets: ["DEEZER_ARL", "DEEZER_ARL_1..50", "API_KEY", "API_KEY_1..50", "ADMIN_API_KEY", "STREAM_TOKEN_SECRET"]
+      secrets: ["DEEZER_ARL", "DEEZER_ARL_1..50", "API_KEY", "API_KEY_1..50", "ADMIN_API_KEY", "STREAM_TOKEN_SECRET", "ARL_SHARE_SECRET"]
     },
     security: {
       secrets: "ARLs, client API keys, and ADMIN_API_KEY are credentials and should be stored as Cloudflare Secrets, not plaintext vars.",
@@ -4572,6 +4864,7 @@ function routingInfo(env) {
       long_lived_credential_in_url: false,
       refresh_note: "Browsers must obtain/refresh /device on the same host so the __Host- cookie is present. Native clients should persist device_token and send X-Voria-Device."
     },
+    arl_sharing: arlShareStatus(env),
     media_resolution: {
       reauthentication_retries: getMediaRetryCount(env),
       timeout_ms: getMediaTimeoutMs(env),
@@ -4581,7 +4874,7 @@ function routingInfo(env) {
       quality_ladder: "FLAC -> MP3_320 -> MP3_128"
     },
     routes: {
-      GET: ["/", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/recommendations", "/cover", "/lyrics", "/stream-track", "/stream", "/track/:id/stream", "/track/:id/lyrics", "/ping", "/device", "/routing", "/env", "/docs", "/testRoutings", "/testRouting"],
+      GET: ["/", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/recommendations", "/cover", "/lyrics", "/stream-track", "/stream", "/track/:id/stream", "/track/:id/lyrics", "/ping", "/device", "/routing", "/env", "/docs", "/arl-share/sync", "/arl-share/request", "/testRoutings", "/testRouting"],
       OPTIONS: ["/*"],
       HEAD: ["/stream", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/cover", "/ping", "/device", "/routing", "/env", "/docs", "/testRoutings", "/testRouting"]
     },
@@ -4603,7 +4896,7 @@ function routingInfo(env) {
 
 
 const worker = {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: getCorsHeaders(env) });
@@ -4621,6 +4914,16 @@ const worker = {
     const routePath = requestUrl.pathname.replace(/\/+$/, "") || "/";
     const segments = routePath.split("/").filter(Boolean);
     const primaryRoute = segments[0] || "";
+
+    const isArlShareRoute = primaryRoute === "arl-share";
+    if (isArlShareRoute) {
+      const response = await handleArlShareRoute(request, env, requestUrl, requestId);
+      return request.method === "HEAD" ? new Response(null, { status: response.status, headers: response.headers }) : response;
+    }
+
+    // Load persisted shared ARLs before pool/auth selection. Once a hot copy
+    // exists, refresh authorization in the background so playback stays fast.
+    await maybeSyncSharedArls(env, ctx, false, requestUrl.origin);
 
     if (isTestRoutingsPath(requestUrl)) {
       const testAuth = authenticateTestRoutings(requestUrl, env);
@@ -4652,7 +4955,7 @@ const worker = {
       return request.method === "HEAD" ? new Response(null, { status: 200, headers }) : new Response(html, { status: 200, headers });
     }
 
-    if (request.method === "HEAD" && !["stream", "info", "search", "track", "album", "artist", "playlist", "chart", "genre", "radio", "cover", "ping", "device", "routing", "env", "docs", "testRoutings", "testRouting"].includes((requestUrl.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || ""))) {
+    if (request.method === "HEAD" && !["stream", "info", "search", "track", "album", "artist", "playlist", "chart", "genre", "radio", "cover", "ping", "device", "routing", "env", "docs", "arl-share", "testRoutings", "testRouting"].includes((requestUrl.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || ""))) {
       return new Response(null, { status: 404, headers: { ...getCorsHeaders(env), "X-Request-ID": requestId } });
     }
 
@@ -4728,7 +5031,8 @@ const worker = {
 
         let configured = arls;
         if (auth.allowedSlots && auth.allowedSlots.size > 0) {
-          configured = configured.filter(c => auth.allowedSlots.has(c.slot));
+          const allowShared = envBoolean(env, "ARL_SHARE_ACCESS", false);
+          configured = configured.filter(c => c.shared ? allowShared : auth.allowedSlots.has(c.slot));
         }
 
         const results = await Promise.all(configured.map(item => {
@@ -4738,7 +5042,10 @@ const worker = {
             status: "active",
             tier: session.canLossless ? "lossless" : (session.can320 ? "320" : "128"),
             capabilities: ["MP3_128", ...(session.can320 ? ["MP3_320"] : []), ...(session.canLossless ? ["FLAC"] : [])],
-          })).catch(() => ({ slot: item.slot, variable: item.name, status: "failed" }));
+            shared: item.shared === true,
+            source: item.shared ? (item.sourceUrl || null) : "local",
+            origin_slot: item.shared ? (item.originSlot || null) : null,
+          })).catch(() => ({ slot: item.slot, variable: item.name, status: "failed", shared: item.shared === true, source: item.shared ? (item.sourceUrl || null) : "local", origin_slot: item.shared ? (item.originSlot || null) : null }));
         }));
 
         const active = results.filter(r => r.status === "active");
