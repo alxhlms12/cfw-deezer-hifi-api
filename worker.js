@@ -1,28 +1,20 @@
-// cfw-deezer-hifi-api-v1.2.4-final-sweep
-// Leech-resistance hardening: authenticated playback entry points require one-use
-// bootstrap tokens by default; same-isolate replay races are serialized; optional
-// Durable Object coordination provides globally atomic token consumption.
-// Production optimization pass: cached hot-path crypto, in-flight upstream
-// coalescing, compact JSON by default, strict bootstrap/session token typing,
-// and unique non-coalesced 256-bit bootstrap nonces.
-// Derived from cfw-deezer-hifi-api-v11-random-nonce.
-import { DurableObject } from "cloudflare:workers";
-
 const DEEZER_GW = "https://www.deezer.com/ajax/gw-light.php";
 const DEEZER_MEDIA_API = "https://media.deezer.com/v1/get_url";
 const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.2.4";
+const API_VERSION = "1.4.19";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
 
 
 
+
 const SAFE_DEFAULT_CHUNK = 512 * 1024;
-const SAFE_MAX_CHUNK = 512 * 1024;
+const SAFE_MIN_CHUNK = 64 * 1024;
+const SAFE_MAX_CHUNK_HARD = 1024 * 1024;
 
 function getCorsHeaders(env) {
   const origin = env?.CORS_ALLOW_ORIGIN?.trim() || "*";
@@ -30,7 +22,7 @@ function getCorsHeaders(env) {
     "Access-Control-Allow-Origin": origin,
     "Vary": "Origin",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, X-Chunk-Size, X-API-Key, X-Request-ID",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, X-Chunk-Size, X-API-Key, X-Request-ID, X-Voria-Device",
     "Access-Control-Expose-Headers": "Content-Length, Content-Type, Accept-Ranges, Content-Range, Server-Timing, X-Timing-Fetch-Ms, X-Timing-Process-Ms, X-Timing-Total-Ms, X-CPU-Safety, X-ARL-Slot, X-ARL-Tier, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset-Ms",
   };
 }
@@ -531,6 +523,50 @@ function isAltVersion(track) {
   return /\b(remix|rmx|mashup|mash-up|live\s+at\b|live\s+from\b|live\s+in\b)\b/i.test(title);
 }
 
+function normalizeDedupText(value) {
+  return String(value ?? "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[’‘]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getTrackDedupKeys(track) {
+  if (!track) return [];
+  const keys = [];
+  const id = track.id ?? track.SNG_ID ?? track.trackId;
+  const isrc = normalizeSharedIsrc(track.isrc || track.ISRC);
+  const artist = normalizeDedupText(track.artist?.name || track.artist_name || track.ART_NAME);
+  const titleShort = normalizeDedupText(track.title_short || track.title || track.SNG_TITLE);
+  const album = normalizeDedupText(track.album?.title || track.album?.displayTitle || track.album_title || track.ALB_TITLE);
+  const durationRaw = track.duration ?? track.DURATION;
+  const duration = Number(durationRaw);
+
+  if (id !== undefined && id !== null && String(id).trim()) keys.push(`id:${String(id).trim()}`);
+  if (isrc) keys.push(`isrc:${isrc}`);
+
+  // Metadata identity is deliberately strict: artist + short title + album + duration.
+  // This catches duplicate Deezer catalog entries even when their IDs/ISRCs differ,
+  // while avoiding broad title-only matches between genuinely different recordings.
+  if (artist && titleShort && album && Number.isFinite(duration) && duration >= 0) {
+    keys.push(`meta:${artist}|${titleShort}|${album}|${Math.round(duration)}`);
+  }
+
+  return keys;
+}
+
+function addTrackDedupKeys(seenKeys, track) {
+  const keys = getTrackDedupKeys(track);
+  if (!keys.length) return false;
+  for (const key of keys) {
+    if (seenKeys.has(key)) return false;
+  }
+  for (const key of keys) seenKeys.add(key);
+  return true;
+}
+
 function isAltAllowed(requestUrl, explicitQuery = "", env = null) {
   const altParam = requestUrl.searchParams.get("alt");
   if (altParam !== null) {
@@ -894,25 +930,33 @@ function decryptAlignedBuffer(cipher, buffer, startBlock, abortSignal = null) {
   }
 }
 
+function getMaxChunkSize(env = null) {
+  const configured = Number.parseInt(env?.STREAM_MAX_CHUNK_SIZE_BYTES || env?.STREAM_MAX_CHUNK_SIZE || "", 10);
+  if (!Number.isFinite(configured) || configured <= 0) return SAFE_MAX_CHUNK_HARD;
+  const clamped = Math.max(SAFE_MIN_CHUNK, Math.min(SAFE_MAX_CHUNK_HARD, configured));
+  return Math.floor(clamped / 2048) * 2048;
+}
+
 function getSafeChunkSize(requestUrl, env) {
+  const maxChunk = getMaxChunkSize(env);
   const param = requestUrl.searchParams.get("chunk_size") ||
                 requestUrl.searchParams.get("chunk") ||
                 env?.STREAM_CHUNK_SIZE ||
                 env?.CHUNK_SIZE;
 
-  if (!param) return SAFE_DEFAULT_CHUNK;
+  if (!param) return Math.min(SAFE_DEFAULT_CHUNK, maxChunk);
   const clean = String(param).toLowerCase().trim();
 
-  if (clean === "256k" || clean === "256kb") return 256 * 1024;
-  if (clean === "512k" || clean === "512kb") return 512 * 1024;
+  if (clean === "256k" || clean === "256kb") return Math.min(256 * 1024, maxChunk);
+  if (clean === "512k" || clean === "512kb") return Math.min(512 * 1024, maxChunk);
 
   const parsed = parseInt(clean, 10);
   if (Number.isFinite(parsed) && parsed > 0) {
-    const clamped = Math.max(64 * 1024, Math.min(SAFE_MAX_CHUNK, parsed));
+    const clamped = Math.max(SAFE_MIN_CHUNK, Math.min(maxChunk, parsed));
     return Math.floor(clamped / 2048) * 2048;
   }
 
-  return SAFE_DEFAULT_CHUNK;
+  return Math.min(SAFE_DEFAULT_CHUNK, maxChunk);
 }
 
 
@@ -1052,37 +1096,70 @@ function pickAuxiliarySession(pools, env = null) {
 
 
 
+function getJwtExpiryMs(jwt) {
+  try {
+    const parts = String(jwt || "").split(".");
+    if (parts.length < 2) return 0;
+    const normalized = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const payload = JSON.parse(atob(normalized + "=".repeat((4 - normalized.length % 4) % 4)));
+    const exp = Number(payload?.exp || 0);
+    return Number.isFinite(exp) && exp > 0 ? exp * 1000 : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
 async function getPipeJwt(arl, forceRefresh = false, env = null) {
+  const cleanArl = String(arl || "").trim();
+  if (!cleanArl) return null;
+
   if (!forceRefresh) {
-    const cachedJwt = jwtCache.get(arl);
+    const cachedJwt = jwtCache.get(cleanArl);
     if (cachedJwt) return cachedJwt;
   }
 
-  const endpoints = [DEEZER_AUTH_ARL, DEEZER_AUTH_RENEW];
-  for (const url of endpoints) {
-    try {
-      const resp = await fetchWithTimeout(url, {
-        method: "POST",
-        headers: {
-          "User-Agent": BROWSER_HEADERS["User-Agent"],
-          "Origin": "https://www.deezer.com",
-          "Referer": "https://www.deezer.com/",
-          Cookie: `arl=${arl}`,
-        },
-        body: "",
-      }, env);
+  // Pipe authentication uses ARL -> JWT. Deezer returns text/plain
+  // containing JSON, so parsing only response.json is not sufficient.
+  try {
+    const resp = await fetchWithTimeout(DEEZER_AUTH_ARL, {
+      method: "POST",
+      headers: {
+        "User-Agent": BROWSER_HEADERS["User-Agent"],
+        "Origin": "https://www.deezer.com",
+        "Referer": "https://www.deezer.com/",
+        Cookie: `arl=${cleanArl}`,
+        Accept: "application/json, text/plain, */*",
+      },
+      body: "",
+    }, env);
 
-      const result = await readResponseLimited(resp);
-      const jwt = result.json?.jwt;
-      if (jwt) {
-        jwtCache.set(arl, jwt, 1000 * 300);
-        return jwt;
-      }
-    } catch (_) {}
+    const result = await readResponseLimited(resp);
+    if (!result.ok) {
+      jwtCache.delete(cleanArl);
+      return null;
+    }
+
+    let payload = result.json;
+    if (!payload && result.text) {
+      try { payload = JSON.parse(String(result.text).trim()); } catch (_) {}
+    }
+
+    const jwt = String(payload?.jwt || payload?.token || payload?.access_token || "").trim();
+    if (!jwt) {
+      jwtCache.delete(cleanArl);
+      return null;
+    }
+
+    const expiry = getJwtExpiryMs(jwt);
+    const ttl = expiry
+      ? Math.max(30_000, Math.min(330_000, expiry - Date.now() - 30_000))
+      : 300_000;
+    jwtCache.set(cleanArl, jwt, ttl);
+    return jwt;
+  } catch (_) {
+    jwtCache.delete(cleanArl);
+    return null;
   }
-
-  jwtCache.delete(arl);
-  return null;
 }
 
 const GQL_RECOMMENDATIONS_QUERY = `
@@ -1159,6 +1236,164 @@ function normalizeGraphqlRecommendationTrack(track) {
   });
 }
 
+const GQL_SIMILAR_TRACKS_QUERY = `
+query GetSimilarTracks($trackId: String!) {
+  track(trackId: $trackId) {
+    id
+    recommendedTracks {
+      id
+      title
+      ISRC
+      duration
+      isExplicit
+      popularity
+      album { id displayTitle cover { id urls(pictureRequest: { width: 1000, height: 1000 }) } }
+      contributors(first: 10, roles: [MAIN, FEATURED]) {
+        edges { roles node { ... on Artist { id name } } }
+      }
+    }
+  }
+}`;
+
+function extractGraphqlTrackList(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [];
+  if (Array.isArray(value.data)) return value.data;
+  if (Array.isArray(value.edges)) return value.edges.map(edge => edge?.node || edge).filter(Boolean);
+  if (Array.isArray(value.nodes)) return value.nodes;
+  if (Array.isArray(value.tracks)) return value.tracks;
+  return [];
+}
+
+async function getPublicSimilarRecommendations(seed, env = null, apiToken = null, clientIp = "", allowAlt = false, preferExplicit = true, limit = 25, offset = 0) {
+  const requestedCount = Math.min(50, Math.max(1, Number(limit) || 25));
+  const requestedOffset = Math.max(0, Number(offset) || 0);
+  const seedId = String(seed?.id || "");
+  const seedArtistId = String(seed?.artist?.id || "");
+
+  if (!seedId || !seedArtistId) {
+    const error = new Error("The seed track does not contain enough artist metadata for public recommendation fallback");
+    error.status = 502;
+    error.code = "RECOMMENDATION_FALLBACK_METADATA_FAILED";
+    throw error;
+  }
+
+  const artistIds = new Set([seedArtistId]);
+  try {
+    const related = await publicApi(`artist/${encodeURIComponent(seedArtistId)}/related`, { limit: 10, index: 0 }, env, apiToken, clientIp);
+    for (const artistItem of related?.data || []) {
+      const relatedId = artistItem?.id;
+      if (relatedId && artistIds.size < 9) artistIds.add(String(relatedId));
+    }
+  } catch (_) {}
+
+  const artistIdList = [...artistIds];
+  const topResults = await Promise.all(artistIdList.map(async (artistId) => {
+    try {
+      const result = await publicApi(`artist/${encodeURIComponent(artistId)}/top`, { limit: 25, index: 0 }, env, apiToken, clientIp);
+      return Array.isArray(result?.data) ? result.data : [];
+    } catch (_) {
+      return [];
+    }
+  }));
+
+  const seen = new Set([seedId]);
+  const tracks = [];
+  for (let artistIndex = 0; artistIndex < topResults.length; artistIndex++) {
+    const items = topResults[artistIndex];
+    for (const track of items) {
+      const trackId = String(track?.id || "");
+      if (!trackId || seen.has(trackId)) continue;
+      seen.add(trackId);
+      if (!allowAlt && isAltVersion(track)) continue;
+      if (!preferExplicit && (track?.explicit_lyrics || track?.explicit_content_lyrics || track?.explicit_content_cover)) continue;
+      tracks.push(track);
+    }
+  }
+
+  const page = tracks.slice(requestedOffset, requestedOffset + requestedCount)
+    .map(track => normalizeTrack(track, null, apiToken))
+    .filter(Boolean);
+
+  const hasMore = tracks.length > requestedOffset + page.length;
+  return {
+    data: page,
+    total: tracks.length,
+    next: hasMore ? `?limit=${requestedCount}&offset=${requestedOffset + page.length}` : null,
+    previous: requestedOffset > 0 ? `?limit=${requestedCount}&offset=${Math.max(0, requestedOffset - requestedCount)}` : null,
+    seed: normalizeTrack(seed, null, apiToken),
+    seed_id: seedId,
+    source: "deezer_public_related_artist_fallback",
+  };
+}
+
+async function getSimilarRecommendations({ id = null, isrc = null, query = null, title = null, artist = null }, env = null, apiToken = null, clientIp = "", allowAlt = false, preferExplicit = true, limit = 25, offset = 0) {
+  const cleanQuery = query ? String(query).trim() : "";
+  const cleanTitle = title ? String(title).trim() : "";
+  const cleanArtist = artist ? String(artist).trim() : "";
+  const seed = await discoverTrack({ id, isrc, query: cleanQuery, title: cleanTitle, artist: cleanArtist }, env, allowAlt, preferExplicit);
+  if (!seed?.id) { const error = new Error("Could not resolve the recommendation seed track"); error.status = 404; error.code = "RECOMMENDATION_SEED_NOT_FOUND"; throw error; }
+
+  const requestedCount = Math.min(50, Math.max(1, Number(limit) || 25));
+  const requestedOffset = Math.max(0, Number(offset) || 0);
+  const fetchCount = Math.min(50, requestedCount + requestedOffset);
+  const pools = await getCandidatePools(env, null);
+  const session = pickAuxiliarySession(pools, env) || pools.lossless[0]?.session || pools.lossy[0]?.session;
+  if (!session?.arl) { const error = new Error("No authenticated Deezer session available for similar-track recommendations"); error.status = 503; error.code = "RECOMMENDATION_SESSION_UNAVAILABLE"; throw error; }
+
+  let jwt = await getPipeJwt(session.arl, false, env);
+  if (!jwt) {
+    return await getPublicSimilarRecommendations(seed, env, apiToken, clientIp, allowAlt, preferExplicit, limit, offset);
+  }
+
+  const execute = async (token) => fetchWithTimeout(DEEZER_PIPE_GQL, {
+    method: "POST",
+    headers: { ...BROWSER_HEADERS, "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+    body: JSON.stringify({ operationName: "GetSimilarTracks", variables: { trackId: String(seed.id) }, query: GQL_SIMILAR_TRACKS_QUERY }),
+  }, env);
+
+  let response = await execute(jwt);
+  let result = await readResponseLimited(response);
+  if (response.status === 401 || result.json?.errors?.some(e => /token|auth|jwt|signature/i.test(e?.message || ""))) {
+    jwtCache.delete(session.arl);
+    jwt = await getPipeJwt(session.arl, true, env);
+    if (jwt) { response = await execute(jwt); result = await readResponseLimited(response); }
+  }
+  if (!result.ok || result.json?.errors?.length) {
+    const message = result.json?.errors?.map(e => e?.message).filter(Boolean).join("; ") || `Deezer similar-track request failed (${result.status})`;
+    try {
+      return await getPublicSimilarRecommendations(seed, env, apiToken, clientIp, allowAlt, preferExplicit, limit, offset);
+    } catch (fallbackError) {
+      const error = new Error(`${message}; fallback failed: ${fallbackError?.message || "unknown fallback error"}`);
+      error.status = result.status >= 400 ? result.status : (fallbackError?.status >= 400 ? fallbackError.status : 502);
+      error.code = "DEEZER_SIMILAR_TRACKS_UPSTREAM_ERROR";
+      throw error;
+    }
+  }
+
+  const trackNode = result.json?.data?.track;
+  let tracks = extractGraphqlTrackList(trackNode?.recommendedTracks);
+  if (!tracks.length) tracks = extractGraphqlTrackList(trackNode?.recommended_tracks);
+  if (!tracks.length) {
+    return await getPublicSimilarRecommendations(seed, env, apiToken, clientIp, allowAlt, preferExplicit, limit, offset);
+  }
+  tracks = tracks.filter(track => String(track?.id || "") !== String(seed.id));
+  if (!allowAlt && tracks.length) { const standard = tracks.filter(track => !isAltVersion(track)); if (standard.length) tracks = standard; }
+
+  const page = tracks.slice(requestedOffset, requestedOffset + requestedCount)
+    .map(track => normalizeGraphqlRecommendationTrack(track) || normalizeTrack(track, null, apiToken)).filter(Boolean);
+  const hasMore = tracks.length > requestedOffset + page.length || (tracks.length >= fetchCount && fetchCount < 50);
+  return {
+    data: page,
+    total: null,
+    next: hasMore ? `?limit=${requestedCount}&offset=${requestedOffset + page.length}` : null,
+    previous: requestedOffset > 0 ? `?limit=${requestedCount}&offset=${Math.max(0, requestedOffset - requestedCount)}` : null,
+    seed: normalizeTrack(seed, null, apiToken),
+    seed_id: String(seed.id),
+    source: "deezer_pipe_recommendedTracks",
+  };
+}
+
 async function getPersonalizedRecommendations(env, allowedSlots = null, limit = 25, offset = 0, requestedUserId = null) {
   const pools = await getCandidatePools(env, allowedSlots);
   const session = pickAuxiliarySession(pools, env) || pools.lossless[0]?.session || pools.lossy[0]?.session;
@@ -1211,7 +1446,7 @@ async function getPersonalizedRecommendations(env, allowedSlots = null, limit = 
     const message = result.json?.errors?.map(e => e?.message).filter(Boolean).join("; ") || `Deezer recommendations request failed (${result.status})`;
     const error = new Error(message);
     error.status = result.status >= 400 ? result.status : 502;
-    error.code = "DEEZZER_RECOMMENDATIONS_UPSTREAM_ERROR";
+    error.code = "DEEZER_RECOMMENDATIONS_UPSTREAM_ERROR";
     throw error;
   }
 
@@ -1531,12 +1766,12 @@ async function getTrackTokensUncached(arl, session, trackId) {
   return trackData;
 }
 
-async function getTrackTokens(arl, session, trackId) {
+async function getTrackTokens(arl, session, trackId, env = null) {
   const key = `${String(arl)}|${String(session?.sid || "")}|${String(trackId)}`;
   let pending = trackTokenInflight.get(key);
   if (pending) return pending;
   pending = getTrackTokensUncached(arl, session, trackId);
-  trackTokenInflight.set(key, pending, 5000);
+  trackTokenInflight.set(key, pending, getTrackTokenInflightTtlMs(env));
   pending.finally(() => trackTokenInflight.delete(key)).catch(() => {});
   return pending;
 }
@@ -1551,6 +1786,18 @@ function getMediaRetryCount(env = null) {
   const value = Number(env?.MEDIA_REAUTH_RETRIES);
   if (!Number.isFinite(value) || value < 0) return 1;
   return Math.max(0, Math.min(3, Math.floor(value)));
+}
+
+function getMediaInflightTtlMs(env = null) {
+  const value = Number(env?.MEDIA_INFLIGHT_TTL_MS);
+  if (!Number.isFinite(value) || value <= 0) return 5000;
+  return Math.max(1000, Math.min(30000, Math.floor(value)));
+}
+
+function getTrackTokenInflightTtlMs(env = null) {
+  const value = Number(env?.TRACK_TOKEN_INFLIGHT_TTL_MS);
+  if (!Number.isFinite(value) || value <= 0) return 5000;
+  return Math.max(1000, Math.min(30000, Math.floor(value)));
 }
 
 function isMediaAuthFailure(error) {
@@ -1636,7 +1883,7 @@ async function resolveMediaStream(licenseToken, trackToken, targetFormat, env = 
   let pending = mediaInflight.get(key);
   if (pending) return pending;
   pending = resolveMediaStreamUncached(licenseToken, trackToken, targetFormat, env);
-  mediaInflight.set(key, pending, 5000);
+  mediaInflight.set(key, pending, getMediaInflightTtlMs(env));
   pending.finally(() => mediaInflight.delete(key)).catch(() => {});
   return pending;
 }
@@ -1644,7 +1891,7 @@ async function resolveMediaStream(licenseToken, trackToken, targetFormat, env = 
 async function refreshCandidateForMedia(candidate, trackId, env) {
   clearArlCache(candidate.arl);
   candidate.session = await getOrRenewSession(candidate.arl, env, true);
-  candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId);
+  candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId, env);
   if (!candidate.trackTokens?.TRACK_TOKEN) {
     throw new Error("Fresh Deezer track token was not returned after session renewal");
   }
@@ -1692,10 +1939,10 @@ async function resolvePlaybackStreamOnly(trackId, rawQuality, env, allowedSlots 
         if (targetFormat === "MP3_320" && candidate.session.can320 === false) continue;
 
         if (!candidate.trackTokens) {
-          candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId);
+          candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId, env);
           if (!candidate.trackTokens?.TRACK_TOKEN) {
             candidate.session = await getOrRenewSession(candidate.arl, env, true);
-            candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId);
+            candidate.trackTokens = await getTrackTokens(candidate.arl, candidate.session, trackId, env);
           }
         }
 
@@ -1971,6 +2218,102 @@ function catalogHeaders() {
   return { "User-Agent": BROWSER_HEADERS["User-Agent"], "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9" };
 }
 
+
+async function getGatewaySession(env) {
+  const pools = await getCandidatePools(env, null);
+  const candidates = [
+    ...(pools.lossless || []),
+    ...(pools.lossy || []),
+  ];
+  for (const candidate of candidates) {
+    const session = candidate?.session;
+    if (session?.apiToken) return session;
+  }
+  const error = new Error("No authenticated Deezer gateway session available");
+  error.status = 503;
+  error.code = "GATEWAY_SESSION_UNAVAILABLE";
+  throw error;
+}
+
+async function deezerGateway(method, params = {}, env = null, retryAuth = true) {
+  const session = await getGatewaySession(env);
+  const url = new URL(DEEZER_GW);
+  url.searchParams.set("method", method);
+  url.searchParams.set("input", "3");
+  url.searchParams.set("api_version", "1.0");
+  url.searchParams.set("api_token", session.apiToken);
+
+  // Deezer gw-light expects method arguments in the POST JSON body. Some
+  // methods may appear to accept query-string arguments, but returning HTTP
+  // 200 with an error envelope is a common failure mode when their payload is
+  // placed in the URL instead. Keep only the gateway metadata in the query
+  // string and send the actual method payload as JSON.
+  const body = JSON.stringify(params || {});
+  const response = await fetchWithTimeout(url.toString(), {
+    method: "POST",
+    headers: { ...BROWSER_HEADERS, "Content-Type": "application/json" },
+    body,
+  }, env);
+  const result = await readResponseLimited(response);
+
+  if (!result.ok || result.json?.error) {
+    const upstream = result.json?.error || {};
+    const errorText = typeof upstream === "string"
+      ? upstream
+      : upstream.message || upstream.MESSAGE || upstream.error || `Deezer gateway ${method} failed (${result.status})`;
+    const error = new Error(errorText);
+    error.status = result.status >= 400 ? result.status : 502;
+    error.code = upstream.code || upstream.CODE || `GATEWAY_${method.replace(/[^A-Za-z0-9]+/g, "_").toUpperCase()}`;
+
+    // Deezer can rotate the gateway checkForm/api token while the Worker still
+    // has the old session cached. Refresh that ARL session once and retry the
+    // exact same request before surfacing the failure.
+    const combined = `${errorText} ${error.code}`.toLowerCase();
+    const authFailure = /valid_token|invalid.*token|token.*invalid|expired.*token|login_required|authentication|unauthor/i.test(combined);
+    if (retryAuth && authFailure && session?.arl) {
+      try {
+        clearArlCache(session.arl);
+        await getOrRenewSession(session.arl, env, true);
+        return await deezerGateway(method, params, env, false);
+      } catch (_) {}
+    }
+    throw error;
+  }
+  return result.json;
+}
+
+function gatewayTrackList(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [];
+  return value.data || value.tracks || value.results || value.songs || [];
+}
+
+async function getGatewayTrackMix(trackId, env, limit = 50, startWithInputTrack = true) {
+  const result = await deezerGateway("song.getSearchTrackMix", {
+    sng_id: String(trackId),
+    nb: Math.min(100, Math.max(1, Number(limit) || 50)),
+    start_with_input_track: startWithInputTrack ? 1 : 0,
+  }, env);
+  return gatewayTrackList(result);
+}
+
+async function getGatewayArtistRadio(artistId, env, limit = 50) {
+  const result = await deezerGateway("smart.getSmartRadio", {
+    art_id: String(artistId),
+    nb: Math.min(100, Math.max(1, Number(limit) || 50)),
+  }, env);
+  return gatewayTrackList(result);
+}
+
+async function getGatewayGenreChart(genreId, env, limit = 50, offset = 0) {
+  const result = await deezerGateway("chart.getCharts", {
+    genre_id: String(genreId),
+    nb: Math.min(100, Math.max(1, Number(limit) || 50)),
+    start: Math.max(0, Number(offset) || 0),
+  }, env);
+  return result;
+}
+
 async function publicApi(path, params = {}, env = null) {
   const url = new URL(`${PUBLIC_API_BASE}/${String(path).replace(/^\//, "")}`);
   for (const [key, value] of Object.entries(params)) if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
@@ -2013,8 +2356,8 @@ async function publicApi(path, params = {}, env = null) {
   return run;
 }
 
-async function catalogResponse(data, status = 200, maxAge = 60, env = null, apiToken = null, clientIp = "unknown", userAgentHash = null) {
-  const decoratedData = await decorateStreamUrls(data, apiToken, clientIp, env, userAgentHash);
+async function catalogResponse(data, status = 200, maxAge = 60, env = null, apiToken = null, clientIp = "unknown", userAgentHash = null, deviceCredential = null) {
+  const decoratedData = await decorateStreamUrls(data, apiToken, clientIp, env, userAgentHash, deviceCredential);
   const serialized = serializeJson(decoratedData, env);
   const containsClientApiKey = serialized.includes('"api_key="') || serialized.includes("api_key=");
   return new Response(serialized, {
@@ -2035,6 +2378,17 @@ function apiErrorResponse(message, status = 400, details = null, env = null, req
 }
 function publicError(code, status, env, requestId) {
   return jsonResponse({ error: code, status, request_id: requestId }, status, { "X-Request-ID": requestId, "Cache-Control": "no-store" }, env);
+}
+
+function invalidStreamBootstrapToken(reason, status, env, requestId) {
+  return jsonResponse({
+    error: "Invalid stream bootstrap token",
+    code: "INVALID_STREAM_TOKEN",
+    reason: String(reason || "invalid"),
+  }, status, {
+    "X-Request-ID": requestId,
+    "Cache-Control": "no-store",
+  }, env);
 }
 
 function normalizeLimitOffset(url, defaultLimit = 25, maxLimit = 100) {
@@ -2093,6 +2447,148 @@ async function randomTokenNonce(bytes = 32) {
   const randomBytes = crypto.getRandomValues(new Uint8Array(size));
   // Hash the CSPRNG output so the nonce is a fixed 256-bit SHA-256 value.
   return bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", randomBytes)));
+}
+
+function deviceBoundStreamsEnabled(env) {
+  return envBoolean(env, "DEVICE_BOUND_SIGNED_STREAMS", false);
+}
+
+function getDeviceBoundTokenTtlSeconds(env) {
+  const value = Number.parseInt(env?.DEVICE_BOUND_TOKEN_TTL_SECONDS, 10);
+  if (!Number.isFinite(value)) return 2592000;
+  return Math.min(31536000, Math.max(3600, value));
+}
+
+async function getDeviceBoundSecret(env) {
+  const configured = String(env?.DEVICE_BOUND_SECRET || "").trim();
+  if (configured) return configured;
+  const streamSecret = String(env?.STREAM_TOKEN_SECRET || "").trim();
+  if (streamSecret) return `device:${streamSecret}`;
+  const fallback = String(env?.ADMIN_API_KEY || env?.DEEZER_ARL || env?.DEEZER_ARL_1 || "").trim();
+  if (fallback) return `device-fallback:${fallback}`;
+  return null;
+}
+
+async function getDeviceHmacKey(env) {
+  const secret = await getDeviceBoundSecret(env);
+  if (!secret) return null;
+  const cacheKey = `device-hmac:${secret}`;
+  const cached = streamHmacKeyCache.get(cacheKey);
+  if (cached) return cached;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+  streamHmacKeyCache.set(cacheKey, key, 30 * 60 * 1000);
+  return key;
+}
+
+async function signDeviceCredential(payload, env) {
+  const key = await getDeviceHmacKey(env);
+  if (!key) return null;
+  const encodedPayload = base64UrlEncodeBytes(new TextEncoder().encode(JSON.stringify(payload)));
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(encodedPayload));
+  return `d1.${encodedPayload}.${base64UrlEncodeBytes(signature)}`;
+}
+
+async function registerDeviceCredential(apiToken, env) {
+  const now = Math.floor(Date.now() / 1000);
+  return signDeviceCredential({
+    v: 1,
+    type: "device",
+    id: await randomTokenNonce(32),
+    key: await getClientApiKeyHash(apiToken),
+    iat: now,
+    exp: now + getDeviceBoundTokenTtlSeconds(env),
+  }, env);
+}
+
+async function verifyDeviceCredential(token, apiToken, env) {
+  try {
+    if (!deviceBoundStreamsEnabled(env)) return { valid: true, disabled: true, hash: null, id: null };
+    const value = String(token || "").trim();
+    const parts = value.split(".");
+    if (parts.length !== 3 || parts[0] !== "d1" || parts[1].length > 4096 || parts[2].length > 256) return { valid: false, reason: "malformed" };
+    const key = await getDeviceHmacKey(env);
+    if (!key) return { valid: false, reason: "not_configured" };
+    const payloadBytes = base64UrlDecodeBytes(parts[1]);
+    if (payloadBytes.byteLength > 3072) return { valid: false, reason: "malformed" };
+    const payload = JSON.parse(new TextDecoder().decode(payloadBytes));
+    if (Number(payload?.v) !== 1 || payload?.type !== "device") return { valid: false, reason: "invalid_type" };
+    if (!payload?.id || !/^[a-f0-9]{64}$/.test(String(payload.id))) return { valid: false, reason: "invalid_device_id" };
+    if (!Number.isFinite(Number(payload?.exp)) || Number(payload.exp) <= Math.floor(Date.now() / 1000)) return { valid: false, reason: "expired" };
+    const expectedKeyHash = await getClientApiKeyHash(apiToken);
+    if (String(payload.key || "") !== String(expectedKeyHash || "")) return { valid: false, reason: "api_key_mismatch" };
+    const signature = base64UrlDecodeBytes(parts[2]);
+    if (signature.byteLength !== 32) return { valid: false, reason: "bad_signature" };
+    const valid = await crypto.subtle.verify("HMAC", key, signature, new TextEncoder().encode(parts[1]));
+    if (!valid) return { valid: false, reason: "bad_signature" };
+    return { valid: true, hash: await sha256Hex(value), id: String(payload.id), payload };
+  } catch (_) {
+    return { valid: false, reason: "invalid" };
+  }
+}
+
+function allowQueryDeviceSign(env) {
+  return envBoolean(env, "ALLOW_QUERY_DEVICE_SIGN", false);
+}
+
+const DEVICE_CREDENTIAL_COOKIE = "__Host-VoriaDevice";
+
+function getCookie(request, name) {
+  const header = String(request?.headers?.get("Cookie") || "");
+  if (!header) return "";
+  const parts = header.split(/;\s*/);
+  for (const part of parts) {
+    const index = part.indexOf("=");
+    if (index <= 0) continue;
+    const key = part.slice(0, index).trim();
+    if (key !== name) continue;
+    const value = part.slice(index + 1).trim();
+    try { return decodeURIComponent(value); } catch (_) { return value; }
+  }
+  return "";
+}
+
+function getPresentedDeviceCredential(request, env = null) {
+  const headerCredential = String(request?.headers?.get("X-Voria-Device") || "").trim();
+  if (headerCredential) return headerCredential;
+
+  // Browser/native clients that received /device get an HttpOnly device cookie.
+  // This is what lets a generated streamUrl be clickable without putting the
+  // long-lived d1 credential into the URL. A copied URL therefore does not carry
+  // the device credential to another browser/device.
+  const cookieCredential = getCookie(request, DEVICE_CREDENTIAL_COOKIE);
+  if (cookieCredential) return cookieCredential;
+
+  if (allowQueryDeviceSign(env)) {
+    try {
+      const url = new URL(request.url);
+      // Raw query credentials are intentionally test-only. Generated streamUrl
+      // values use ?device= for the short-lived playback token instead.
+      const explicitCredential = String(url.searchParams.get("device_credential") || "").trim();
+      if (explicitCredential) return explicitCredential;
+      const legacyDevice = String(url.searchParams.get("device") || "").trim();
+      if (legacyDevice.startsWith("d1.")) return legacyDevice;
+    } catch (_) {}
+  }
+  return "";
+}
+
+async function getRequestDeviceBinding(request, apiToken, env) {
+  if (!deviceBoundStreamsEnabled(env)) return { enabled: false, present: false, valid: true, hash: null, id: null };
+  const credential = getPresentedDeviceCredential(request, env);
+  if (!credential) return { enabled: true, present: false, valid: false, hash: null, id: null, reason: "missing" };
+  const headerCredential = String(request?.headers?.get("X-Voria-Device") || "").trim();
+  const source = headerCredential
+    ? "header"
+    : getCookie(request, DEVICE_CREDENTIAL_COOKIE)
+      ? "cookie"
+      : "query";
+  return { enabled: true, present: true, source, ...(await verifyDeviceCredential(credential, apiToken, env)) };
 }
 
 async function getStreamTokenSecret(env) {
@@ -2178,6 +2674,9 @@ async function verifyStreamToken(token, expected, env) {
     if (expected?.userAgentHash && String(payload.ua || "") !== String(expected.userAgentHash)) {
       return { valid: false, reason: payload.ua ? "user_agent_mismatch" : "user_agent_missing" };
     }
+    if (expected?.deviceBindingHash && String(payload.device || "") !== String(expected.deviceBindingHash)) {
+      return { valid: false, reason: payload.device ? "device_mismatch" : "device_missing" };
+    }
 
     const signature = base64UrlDecodeBytes(parts[2]);
     if (signature.byteLength !== 32) return { valid: false, reason: "bad_signature" };
@@ -2198,7 +2697,7 @@ async function verifyStreamBootstrapToken(token, expected, env) {
   return check;
 }
 
-async function buildStreamToken(trackId, apiToken, clientIp, env, userAgentHash = null) {
+async function buildStreamToken(trackId, apiToken, clientIp, env, userAgentHash = null, deviceBindingHash = null) {
   if (!apiToken || String(apiToken).trim() === "" || String(apiToken).trim() === "public") return null;
   const ttl = getStreamTokenTtlSeconds(env);
   const now = Math.floor(Date.now() / 1000);
@@ -2210,6 +2709,7 @@ async function buildStreamToken(trackId, apiToken, clientIp, env, userAgentHash 
     key: await getClientApiKeyHash(apiToken),
     ip: String(clientIp || "unknown"),
     ...(shouldBindStreamTokenToUserAgent(env) && userAgentHash ? { ua: String(userAgentHash) } : {}),
+    ...(deviceBoundStreamsEnabled(env) && deviceBindingHash ? { device: String(deviceBindingHash) } : {}),
     iat: now,
     exp: now + ttl,
   }, env);
@@ -2217,6 +2717,25 @@ async function buildStreamToken(trackId, apiToken, clientIp, env, userAgentHash 
 
 function getClientIp(request) {
   return String(request?.headers?.get("CF-Connecting-IP") || request?.headers?.get("X-Forwarded-For")?.split(",")[0] || "unknown").trim() || "unknown";
+}
+
+function boundedCacheSet(map, key, value, ttlMs, maxSize = 4096) {
+  const now = Date.now();
+  if (map.has(key)) map.delete(key);
+  while (map.size >= maxSize) map.delete(map.keys().next().value);
+  map.set(key, { value, expiresAt: now + ttlMs });
+}
+
+function boundedCacheGet(map, key) {
+  const item = map.get(key);
+  if (!item) return null;
+  if (item.expiresAt <= Date.now()) {
+    map.delete(key);
+    return null;
+  }
+  map.delete(key);
+  map.set(key, item);
+  return item.value;
 }
 
 function shouldBindStreamTokenToUserAgent(env) {
@@ -2248,95 +2767,8 @@ function getStreamSessionRefreshThresholdSeconds(env) {
   return Math.min(Math.max(30, Math.floor(ttl / 2)), Math.max(30, value));
 }
 
-const streamTokenReplayCache = new BoundedMap(2048);
-const streamTokenConsumeInflight = new BoundedMap(2048);
 
-async function consumeStreamBootstrapToken(token, env) {
-  if (!token) return { allowed: false, reason: "missing" };
-  const fingerprint = bytesToHex(await sha256Bytes(String(token)));
-  const cacheKey = `stream-token-used:${fingerprint}`;
-  if (streamTokenReplayCache.has(cacheKey)) return { allowed: false, reason: "replayed" };
-
-  // Serialize concurrent attempts for the same token inside a Worker isolate.
-  // This closes the check-then-mark race where two simultaneous requests could
-  // both observe the token as unused before either one marked it.
-  const inflightKey = `consume:${fingerprint}`;
-  const existingInflight = streamTokenConsumeInflight.get(inflightKey);
-  if (existingInflight) {
-    await existingInflight;
-    return { allowed: false, reason: "replayed" };
-  }
-
-  const consumePromise = (async () => {
-    if (streamTokenReplayCache.has(cacheKey)) return { allowed: false, reason: "replayed" };
-
-    // Optional strongly-consistent distributed replay guard. When a
-    // STREAM_TOKEN_GUARD Durable Object binding is configured, token consumption
-    // is serialized globally (sharded by token hash) and becomes atomic across
-    // Worker isolates and locations.
-    if (env?.STREAM_TOKEN_GUARD) {
-      try {
-        const shard = fingerprint.slice(0, 2);
-        const stub = env.STREAM_TOKEN_GUARD.get(env.STREAM_TOKEN_GUARD.idFromName(`stream-token:${shard}`));
-        const response = await stub.fetch("https://stream-token-guard/consume", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ hash: fingerprint, ttl: Math.max(60, getStreamTokenTtlSeconds(env) + 30) }),
-        });
-        if (!response.ok) throw new Error(`STREAM_TOKEN_GUARD_${response.status}`);
-        const result = await response.json();
-        if (!result?.allowed) {
-          streamTokenReplayCache.set(cacheKey, true, 60000);
-          return { allowed: false, reason: "replayed" };
-        }
-      } catch (guardError) {
-        const failClosed = String(env?.STREAM_TOKEN_GUARD_FAIL_CLOSED ?? "true").trim().toLowerCase();
-        if (["1", "true", "yes", "on"].includes(failClosed)) {
-          return { allowed: false, reason: "replay_guard_unavailable" };
-        }
-      }
-    }
-
-    // Optional distributed replay guard. KV is intentionally best-effort because
-    // Cloudflare KV does not provide an atomic compare-and-set primitive.
-    if (!env?.STREAM_TOKEN_GUARD && env?.GENERAL_MUSIC_CACHE) {
-      try {
-        const existing = await env.GENERAL_MUSIC_CACHE.get(`music:deezer:${cacheKey}`);
-        if (existing) {
-          streamTokenReplayCache.set(cacheKey, true, 60000);
-          return { allowed: false, reason: "replayed" };
-        }
-        await env.GENERAL_MUSIC_CACHE.put(`music:deezer:${cacheKey}`, "1", { expirationTtl: Math.max(60, getStreamTokenTtlSeconds(env) + 30) });
-      } catch (_) {
-        // Keep the local guard active even when KV is unavailable.
-      }
-    }
-
-    streamTokenReplayCache.set(cacheKey, true, Math.max(60000, (getStreamTokenTtlSeconds(env) + 30) * 1000));
-    return { allowed: true };
-  })();
-
-  streamTokenConsumeInflight.set(inflightKey, consumePromise, 15000);
-  try {
-    return await consumePromise;
-  } finally {
-    streamTokenConsumeInflight.delete(inflightKey);
-  }
-}
-
-function getCookie(request, name) {
-  const header = request?.headers?.get("Cookie") || "";
-  const parts = header.split(";");
-  for (const part of parts) {
-    const index = part.indexOf("=");
-    if (index < 0) continue;
-    const key = part.slice(0, index).trim();
-    if (key === name) return part.slice(index + 1).trim();
-  }
-  return null;
-}
-
-async function buildStreamSession(trackId, apiToken, clientIp, env, userAgentHash = null) {
+async function buildStreamSession(trackId, apiToken, clientIp, env, userAgentHash = null, deviceBindingHash = null) {
   if (!apiToken || String(apiToken).trim() === "" || String(apiToken).trim() === "public") return null;
   const now = Math.floor(Date.now() / 1000);
   return signStreamToken({
@@ -2347,6 +2779,7 @@ async function buildStreamSession(trackId, apiToken, clientIp, env, userAgentHas
     key: await getClientApiKeyHash(apiToken),
     ip: String(clientIp || "unknown"),
     ...(shouldBindStreamTokenToUserAgent(env) && userAgentHash ? { ua: String(userAgentHash) } : {}),
+    ...(deviceBoundStreamsEnabled(env) && deviceBindingHash ? { device: String(deviceBindingHash) } : {}),
     iat: now,
     exp: now + getStreamSessionTtlSeconds(env),
   }, env);
@@ -2369,8 +2802,8 @@ function streamSessionCookie(token, env) {
   return `${STREAM_SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; Max-Age=${getStreamSessionTtlSeconds(env)}; HttpOnly; Secure; SameSite=None`;
 }
 
-async function establishStreamSession(trackId, apiToken, clientIp, env, userAgentHash = null) {
-  const token = await buildStreamSession(trackId, apiToken, clientIp, env, userAgentHash);
+async function establishStreamSession(trackId, apiToken, clientIp, env, userAgentHash = null, deviceBindingHash = null) {
+  const token = await buildStreamSession(trackId, apiToken, clientIp, env, userAgentHash, deviceBindingHash);
   return streamSessionCookie(token, env);
 }
 
@@ -2380,35 +2813,46 @@ function authenticatedPlaybackRequiresBootstrap(env, authToken) {
   return ["1", "true", "yes", "on"].includes(value);
 }
 
-async function maybeRefreshStreamSession(sessionCheck, trackId, apiToken, clientIp, env, userAgentHash = null) {
+async function maybeRefreshStreamSession(sessionCheck, trackId, apiToken, clientIp, env, userAgentHash = null, deviceBindingHash = null) {
   if (!sessionCheck?.valid || !sessionCheck?.payload) return null;
   const remaining = Number(sessionCheck.payload.exp) - Math.floor(Date.now() / 1000);
   if (remaining > getStreamSessionRefreshThresholdSeconds(env)) return null;
-  return establishStreamSession(trackId, apiToken, clientIp, env, userAgentHash);
+  return establishStreamSession(trackId, apiToken, clientIp, env, userAgentHash, deviceBindingHash);
 }
 
-async function appendStreamTokenToUrl(streamUrl, apiToken, clientIp, env, userAgentHash = null) {
+async function appendStreamTokenToUrl(streamUrl, apiToken, clientIp, env, userAgentHash = null, deviceBindingHash = null) {
   if (!streamUrl || !apiToken || String(apiToken).trim() === "" || String(apiToken).trim() === "public") return streamUrl;
   try {
     const url = new URL(streamUrl);
     const trackId = url.searchParams.get("id") || url.searchParams.get("track_id");
     if (!trackId) return streamUrl;
 
-    // Bootstrap tokens are one-use credentials. Never coalesce or cache the
+    // Bootstrap tokens are temporary credentials. Never coalesce or cache the
     // generated token: every emitted stream URL receives a fresh nonce.
-    const token = await buildStreamToken(trackId, apiToken, clientIp, env, userAgentHash);
-    if (token) url.searchParams.set("stream_token", token);
+    const token = await buildStreamToken(trackId, apiToken, clientIp, env, userAgentHash, deviceBindingHash);
+    if (token) {
+      if (deviceBoundStreamsEnabled(env) && deviceBindingHash) {
+        // In device-bound mode, the URL carries only a short-lived playback
+        // token. The long-lived d1 device credential NEVER enters streamUrl.
+        // The request still requires X-Voria-Device (or an explicitly supplied
+        // raw d1 credential for testing via ALLOW_QUERY_DEVICE_SIGN).
+        url.searchParams.delete("stream_token");
+        url.searchParams.set("device", token);
+      } else {
+        url.searchParams.set("stream_token", token);
+      }
+    }
     return url.toString();
   } catch (_) {
     return streamUrl;
   }
 }
 
-async function decorateStreamUrls(value, apiToken, clientIp, env, userAgentHash = null) {
+async function decorateStreamUrls(value, apiToken, clientIp, env, userAgentHash = null, deviceCredential = null) {
   if (!apiToken || String(apiToken).trim() === "" || String(apiToken).trim() === "public") return value;
 
   if (Array.isArray(value)) {
-    return Promise.all(value.map(item => decorateStreamUrls(item, apiToken, clientIp, env, userAgentHash)));
+    return Promise.all(value.map(item => decorateStreamUrls(item, apiToken, clientIp, env, userAgentHash, deviceCredential)));
   }
 
   if (value && typeof value === "object") {
@@ -2416,9 +2860,16 @@ async function decorateStreamUrls(value, apiToken, clientIp, env, userAgentHash 
     const out = Array.isArray(value) ? [] : {};
     await Promise.all(entries.map(async ([key, item]) => {
       if (key === "streamUrl" && typeof item === "string" && item.includes("/stream-track/")) {
-        out[key] = await appendStreamTokenToUrl(item, apiToken, clientIp, env, userAgentHash);
+        let streamUrl = appendAuthenticatedStreamCredentials(item, apiToken, deviceCredential, env);
+        if (deviceBoundStreamsEnabled(env)) {
+          const binding = deviceCredential ? await verifyDeviceCredential(deviceCredential, apiToken, env) : { valid: false, hash: null };
+          if (binding.valid && binding.hash) streamUrl = await appendStreamTokenToUrl(streamUrl, apiToken, clientIp, env, userAgentHash, binding.hash);
+        } else {
+          streamUrl = await appendStreamTokenToUrl(streamUrl, apiToken, clientIp, env, userAgentHash);
+        }
+        out[key] = streamUrl;
       } else if (item && typeof item === "object") {
-        out[key] = await decorateStreamUrls(item, apiToken, clientIp, env, userAgentHash);
+        out[key] = await decorateStreamUrls(item, apiToken, clientIp, env, userAgentHash, deviceCredential);
       } else {
         out[key] = item;
       }
@@ -2441,10 +2892,16 @@ function appendApiKeyToStreamUrl(streamUrl, apiToken = null) {
   }
 }
 
-function buildTrackStreamUrl(origin, trackId, apiToken = null) {
+function appendAuthenticatedStreamCredentials(streamUrl, apiToken = null, deviceCredential = null, env = null) {
+  // Never place the long-lived d1 device credential in generated stream URLs.
+  // Device-bound playback tokens are added later by appendStreamTokenToUrl().
+  return appendApiKeyToStreamUrl(streamUrl, apiToken);
+}
+
+function buildTrackStreamUrl(origin, trackId, apiToken = null, deviceCredential = null, env = null) {
   if (!origin || trackId === undefined || trackId === null || String(trackId).trim() === "") return null;
   const streamUrl = `${String(origin).replace(/\/$/, "")}/stream-track/?id=${encodeURIComponent(String(trackId))}`;
-  return appendApiKeyToStreamUrl(streamUrl, apiToken);
+  return appendAuthenticatedStreamCredentials(streamUrl, apiToken, deviceCredential, env);
 }
 
 function normalizeTrack(track, streamOrigin = null, apiToken = null) {
@@ -2660,7 +3117,62 @@ function isMaintenanceMode(env) {
   return envBoolean(env, "MAINTENANCE_MODE", false);
 }
 
-async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, clientIp = "unknown", userAgentHash = null) {
+async function generatedSimilarityPayload(requestUrl, env, apiToken, clientIp, preferExplicit, limit, offset, seedArgs, type = "generated_playlist", deviceCredential = null) {
+  const queryForAlt = seedArgs.query || seedArgs.title || seedArgs.artist || seedArgs.id || seedArgs.isrc || "";
+  const queryAllowsAlt = isAltAllowed(requestUrl, queryForAlt, env, apiToken, clientIp);
+  const seed = await discoverTrack(seedArgs, env, queryAllowsAlt, preferExplicit);
+  if (!seed?.id) {
+    const error = new Error("Could not resolve the recommendation seed track");
+    error.status = 404;
+    error.code = "RECOMMENDATION_SEED_NOT_FOUND";
+    throw error;
+  }
+
+  // The legacy gw song.getSearchTrackMix method is currently returning HTTP 200
+  // application-error envelopes. Use the working Deezer Pipe recommendedTracks
+  // path for seed-aware similarity instead of letting that legacy gateway call
+  // break /playlist and /radio.
+  const similar = await getSimilarRecommendations(
+    { id: seed.id },
+    env,
+    apiToken,
+    clientIp,
+    queryAllowsAlt,
+    preferExplicit,
+    limit,
+    offset
+  );
+
+  const normalizedSeed = similar?.seed || normalizeTrack(seed, requestUrl.origin, apiToken);
+  const page = Array.isArray(similar?.data) ? similar.data : [];
+  const data = [];
+  const seenKeys = new Set();
+
+  if (normalizedSeed?.id != null && addTrackDedupKeys(seenKeys, normalizedSeed)) {
+    data.push({ ...normalizedSeed, streamUrl: buildTrackStreamUrl(requestUrl.origin, normalizedSeed.id, apiToken, deviceCredential, env) });
+  }
+  for (const track of page) {
+    if (!track?.id || !addTrackDedupKeys(seenKeys, track)) continue;
+    data.push({ ...track, streamUrl: buildTrackStreamUrl(requestUrl.origin, track.id, apiToken, deviceCredential, env) });
+  }
+
+  return {
+    version: API_VERSION,
+    type,
+    generated: true,
+    title: normalizedSeed ? `${normalizedSeed.title || "Track"} ${type === "track_radio" ? "Radio" : "Playlist"}` : (type === "track_radio" ? "Track Radio" : "Generated Playlist"),
+    description: normalizedSeed ? `Tracks similar to ${normalizedSeed.title || "this track"}${normalizedSeed.artist?.name ? ` by ${normalizedSeed.artist.name}` : ""}.` : "Tracks similar to the supplied seed.",
+    seed: normalizedSeed,
+    seed_id: normalizedSeed?.id != null ? String(normalizedSeed.id) : String(seed.id),
+    source: similar?.source || "deezer_pipe_recommendedTracks",
+    total: similar?.total ?? data.length,
+    next: similar?.next || null,
+    previous: similar?.previous || null,
+    data,
+  };
+}
+async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, clientIp = "unknown", userAgentHash = null, deviceCredential = null) {
+  const catalogResponseForRequest = (...args) => catalogResponse(...args, deviceCredential);
   const rootSegment = segments[0] || "";
   const subSegment = segments[1] || "";
   const actionSegment = segments[2] || "";
@@ -2669,11 +3181,11 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
   const preferExplicit = isExplicitPreferred(requestUrl, env, apiToken, clientIp);
 
   if (!rootSegment) {
-    return catalogResponse(buildRootStatus(env), 200, 30, env, apiToken, clientIp, userAgentHash);
+    return catalogResponseForRequest(buildRootStatus(env), 200, 30, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "info-api") {
-    return catalogResponse({
+    return catalogResponseForRequest({
       version: API_VERSION,
       provider: "deezer",
       name: "Deezer HiFi Turbo API & Streaming Gateway",
@@ -2682,6 +3194,7 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
       features: {
         structuredSearch: "/?s&title=BMO&artist=Ari Lennox",
         catalog: "/search, /track, /album, /artist, /playlist, /chart, /genre, /radio, /recommendations, /cover",
+        recommendationModes: "personalized by default; song-similar via id, q/query/s, isrc/i, title, artist using Deezer Pipe recommendedTracks",
         loadBalancing: "50-Slot Pool with Multi-Key Role Permissions & 2.5s RPS Limiter",
         lyricsSource: "100% Native Deezer (Web Gateway song.getLyrics + Pipe GraphQL Word-by-Word)",
       },
@@ -2700,7 +3213,7 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
     if (!id && !isrc) return apiErrorResponse("Missing id or isrc parameter", 400, null, env);
     const track = await discoverTrack({ id, isrc }, env, allowAlt, preferExplicit);
     if (!track?.id) return apiErrorResponse("Track not found", 404, null, env);
-    return catalogResponse({ version: API_VERSION, data: normalizeTrack(track, requestUrl.origin, apiToken) }, 200, 30, env, apiToken, clientIp, userAgentHash);
+    return catalogResponseForRequest({ version: API_VERSION, data: normalizeTrack(track, requestUrl.origin, apiToken) }, 200, 30, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "search") {
@@ -2723,7 +3236,7 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
     if (isrc) {
       const track = await discoverTrack({ isrc }, env, queryAllowsAlt, preferExplicit);
       const items = track ? [normalizeTrack(track, requestUrl.origin, apiToken)] : [];
-      return catalogResponse({ version: API_VERSION, type: "track", query: isrc, data: items, total: items.length, next: null, previous: null }, 200, 30, env, apiToken, clientIp, userAgentHash);
+      return catalogResponseForRequest({ version: API_VERSION, type: "track", query: isrc, data: items, total: items.length, next: null, previous: null }, 200, 30, env, apiToken, clientIp, userAgentHash);
     }
 
     const queryInfo = normalizeSearchQuery(q, title, artist);
@@ -2736,7 +3249,7 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
     }
 
     const normalizer = type === "track" ? (track) => normalizeTrack(track, requestUrl.origin, apiToken) : type === "album" ? normalizeAlbum : type === "artist" ? normalizeArtist : type === "playlist" ? normalizePlaylist : x => x;
-    return catalogResponse({ version: API_VERSION, type, query: queryInfo.clean, alt_allowed: queryAllowsAlt, explicit_preferred: preferExplicit, ...normalizeCollection(result, normalizer) }, 200, 30, env, apiToken, clientIp, userAgentHash);
+    return catalogResponseForRequest({ version: API_VERSION, type, query: queryInfo.clean, alt_allowed: queryAllowsAlt, explicit_preferred: preferExplicit, ...normalizeCollection(result, normalizer) }, 200, 30, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "album") {
@@ -2745,7 +3258,7 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
 
     if (actionSegment === "tracks") {
       const tracks = await publicApi(`album/${encodeURIComponent(id)}/tracks`, { limit, index: offset }, env, apiToken, clientIp);
-      return catalogResponse({ version: API_VERSION, ...normalizeCollection(tracks, (track) => normalizeTrack(track, requestUrl.origin, apiToken)) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+      return catalogResponseForRequest({ version: API_VERSION, ...normalizeCollection(tracks, (track) => normalizeTrack(track, requestUrl.origin, apiToken)) }, 200, 120, env, apiToken, clientIp, userAgentHash);
     }
 
     const [album, tracks] = await Promise.all([
@@ -2754,7 +3267,7 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
     ]);
 
     const normalizedTracks = normalizeCollection(tracks, (track) => normalizeTrack(track, requestUrl.origin, apiToken));
-    return catalogResponse({ version: API_VERSION, data: normalizeAlbum(album), tracks: normalizedTracks.data, pagination: { total: normalizedTracks.total, limit, offset } }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    return catalogResponseForRequest({ version: API_VERSION, data: normalizeAlbum(album), tracks: normalizedTracks.data, pagination: { total: normalizedTracks.total, limit, offset } }, 200, 120, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "artist") {
@@ -2763,33 +3276,52 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
 
     if (actionSegment === "top") {
       const top = await publicApi(`artist/${encodeURIComponent(id)}/top`, { limit, index: offset }, env, apiToken, clientIp);
-      return catalogResponse({ version: API_VERSION, ...normalizeCollection(top, (track) => normalizeTrack(track, requestUrl.origin, apiToken)) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+      return catalogResponseForRequest({ version: API_VERSION, ...normalizeCollection(top, (track) => normalizeTrack(track, requestUrl.origin, apiToken)) }, 200, 120, env, apiToken, clientIp, userAgentHash);
     }
 
     if (actionSegment === "albums") {
       const albums = await publicApi(`artist/${encodeURIComponent(id)}/albums`, { limit, index: offset }, env, apiToken, clientIp);
-      return catalogResponse({ version: API_VERSION, ...normalizeCollection(albums, normalizeAlbum) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+      return catalogResponseForRequest({ version: API_VERSION, ...normalizeCollection(albums, normalizeAlbum) }, 200, 120, env, apiToken, clientIp, userAgentHash);
     }
 
     const artist = await publicApi(`artist/${encodeURIComponent(id)}`, {}, env, apiToken, clientIp);
-    return catalogResponse({ version: API_VERSION, artist: normalizeArtist(artist) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    return catalogResponseForRequest({ version: API_VERSION, artist: normalizeArtist(artist) }, 200, 120, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "playlist") {
     const id = subSegment || requestUrl.searchParams.get("id");
-    if (!id) return apiErrorResponse("Missing id parameter", 400, null, env);
+    const isrc = requestUrl.searchParams.get("isrc") || requestUrl.searchParams.get("i");
+    const query = requestUrl.searchParams.get("q") || requestUrl.searchParams.get("query") || requestUrl.searchParams.get("s");
+    const title = requestUrl.searchParams.get("title") || requestUrl.searchParams.get("track") || requestUrl.searchParams.get("song");
+    const artist = requestUrl.searchParams.get("artist");
+    const generate = Boolean(isrc || query || title || artist || (id && /^\d+$/.test(String(id)) && requestUrl.searchParams.get("mode") !== "catalog") || requestUrl.searchParams.get("mode") === "generate" || requestUrl.searchParams.get("playlist") === "generated");
 
-    if (actionSegment === "tracks" || actionSegment === "full") {
-      const tracks = await publicApi(`playlist/${encodeURIComponent(id)}/tracks`, { limit, index: offset }, env, apiToken, clientIp);
-      return catalogResponse({ version: API_VERSION, playlist_id: id, ...normalizeCollection(tracks, (track) => normalizeTrack(track, requestUrl.origin, apiToken)) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    if (generate) {
+      if (!id && !isrc && !query && !title && !artist) return apiErrorResponse("Missing track identifier for generated playlist", 400, { supported_parameters: ["id", "isrc", "q", "query", "s", "title", "artist", "limit", "offset"] }, env);
+      const payload = await generatedSimilarityPayload(requestUrl, env, apiToken, clientIp, preferExplicit, limit, offset, { id, isrc, query, title, artist }, "generated_playlist", deviceCredential);
+      return catalogResponseForRequest(payload, 200, 30, env, apiToken, clientIp, userAgentHash);
     }
 
-    const [playlist, tracks] = await Promise.all([
-      publicApi(`playlist/${encodeURIComponent(id)}`, {}, env),
-      publicApi(`playlist/${encodeURIComponent(id)}/tracks`, { limit, index: offset }, env),
-    ]);
-    const normalizedTracks = normalizeCollection(tracks, (track) => normalizeTrack(track, requestUrl.origin, apiToken));
-    return catalogResponse({ version: API_VERSION, data: normalizePlaylist(playlist), tracks: normalizedTracks.data, pagination: { total: normalizedTracks.total, limit, offset } }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    if (!id) return apiErrorResponse("Missing playlist id or track seed", 400, { generated_playlist: "Use /playlist?id=<track_id>, /playlist?isrc=<isrc>, or /playlist?q=<title artist>" }, env);
+
+    if (actionSegment === "tracks" || actionSegment === "full") {
+      const tracks = await publicApi(`playlist/${encodeURIComponent(id)}/tracks`, { limit, index: offset }, env);
+      return catalogResponseForRequest({ version: API_VERSION, playlist_id: id, ...normalizeCollection(tracks, (track) => normalizeTrack(track, requestUrl.origin, apiToken)) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    }
+
+    try {
+      const [playlist, tracks] = await Promise.all([
+        publicApi(`playlist/${encodeURIComponent(id)}`, {}, env),
+        publicApi(`playlist/${encodeURIComponent(id)}/tracks`, { limit, index: offset }, env),
+      ]);
+      const normalizedTracks = normalizeCollection(tracks, (track) => normalizeTrack(track, requestUrl.origin, apiToken));
+      return catalogResponseForRequest({ version: API_VERSION, data: normalizePlaylist(playlist), tracks: normalizedTracks.data, pagination: { total: normalizedTracks.total, limit, offset } }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    } catch (playlistError) {
+      const track = await discoverTrack({ id }, env, allowAlt, preferExplicit).catch(() => null);
+      if (!track?.id) throw playlistError;
+      const payload = await generatedSimilarityPayload(requestUrl, env, apiToken, clientIp, preferExplicit, limit, offset, { id: String(track.id) }, "generated_playlist", deviceCredential);
+      return catalogResponseForRequest(payload, 200, 30, env, apiToken, clientIp, userAgentHash);
+    }
   }
 
   if (rootSegment === "chart") {
@@ -2798,66 +3330,582 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
     if (!supported.has(type)) return apiErrorResponse("Unsupported chart type", 400, { supported: [...supported] }, env);
     const result = await publicApi(`chart/0/${encodeURIComponent(type)}`, { limit, index: offset }, env, apiToken, clientIp);
     const normalizer = type === "tracks" ? (track) => normalizeTrack(track, requestUrl.origin, apiToken) : type === "albums" ? normalizeAlbum : type === "artists" ? normalizeArtist : normalizePlaylist;
-    return catalogResponse({ version: API_VERSION, type, ...normalizeCollection(result, normalizer) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    return catalogResponseForRequest({ version: API_VERSION, type, ...normalizeCollection(result, normalizer) }, 200, 120, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "genre") {
     const id = subSegment || requestUrl.searchParams.get("id");
     if (!id) {
-      const result = await publicApi("genre", { limit, index: offset }, env, apiToken, clientIp);
-      return catalogResponse({ version: API_VERSION, ...normalizeCollection(result, normalizeGenre) }, 200, 300, env, apiToken, clientIp, userAgentHash);
+      let result = null;
+      try { result = await publicApi("genre", { limit, index: offset }, env); } catch (_) {}
+      if (result?.data?.length) {
+        return catalogResponseForRequest({ version: API_VERSION, type: "genres", ...normalizeCollection(result, normalizeGenre) }, 200, 300, env, apiToken, clientIp, userAgentHash);
+      }
+      const fallbackGenres = [
+        { id: 0, name: "All" }, { id: 132, name: "Pop" }, { id: 116, name: "Rap/Hip Hop" },
+        { id: 152, name: "Rock" }, { id: 113, name: "Dance" }, { id: 106, name: "Electro" },
+        { id: 165, name: "R&B" }, { id: 144, name: "Jazz" }, { id: 98, name: "Classical" },
+        { id: 173, name: "Reggae" }, { id: 197, name: "Soundtracks" }, { id: 464, name: "Metal" },
+        { id: 169, name: "Alternative" },
+      ];
+      const page = fallbackGenres.slice(offset, offset + limit).map(normalizeGenre);
+      return catalogResponseForRequest({ version: API_VERSION, type: "genres", data: page, total: fallbackGenres.length, next: offset + page.length < fallbackGenres.length ? `?limit=${limit}&offset=${offset + page.length}` : null, previous: offset > 0 ? `?limit=${limit}&offset=${Math.max(0, offset - limit)}` : null, source: "deezer_gateway_genre_fallback" }, 200, 300, env, apiToken, clientIp, userAgentHash);
     }
-    const [genre, radios] = await Promise.all([
-      publicApi(`genre/${encodeURIComponent(id)}`, {}, env),
-      publicApi(`genre/${encodeURIComponent(id)}/radios`, { limit, index: offset }, env).catch(() => null),
-    ]);
-    return catalogResponse({ version: API_VERSION, genre: normalizeGenre(genre), radios: radios ? normalizeCollection(radios, normalizeRadio) : null }, 200, 300, env, apiToken, clientIp, userAgentHash);
+    // Deezer's canonical genre chart is /chart/{genre_id}.
+    // Resolve the genre first instead of silently inventing a "Genre {id}" object
+    // when Deezer rejects an invalid/non-existent genre ID.
+    let genre;
+    try {
+      genre = await publicApi(`genre/${encodeURIComponent(id)}`, {}, env);
+    } catch (error) {
+      const status = Number(error?.status) >= 400 ? Number(error.status) : 404;
+      return apiErrorResponse(
+        error?.message || `Genre ${id} was not found`,
+        status,
+        { id: String(id), code: error?.code || "GENRE_NOT_FOUND" },
+        env,
+      );
+    }
+
+    const chart = await publicApi(`chart/${encodeURIComponent(id)}`, { limit, index: offset }, env, apiToken, clientIp);
+    const tracks = Array.isArray(chart?.tracks?.data) ? chart.tracks.data : (Array.isArray(chart?.tracks) ? chart.tracks : []);
+    const artists = Array.isArray(chart?.artists?.data) ? chart.artists.data : (Array.isArray(chart?.artists) ? chart.artists : []);
+    const albums = Array.isArray(chart?.albums?.data) ? chart.albums.data : (Array.isArray(chart?.albums) ? chart.albums : []);
+
+    const normalizedTracks = tracks.map(t => normalizeTrack(t, requestUrl.origin, apiToken)).filter(Boolean);
+    const normalizedArtists = normalizeCollection({ data: artists, total: Number(chart?.artists?.total) || artists.length }, normalizeArtist);
+    const normalizedAlbums = normalizeCollection({ data: albums, total: Number(chart?.albums?.total) || albums.length }, normalizeAlbum);
+
+    // Keep genre responses compact. Do not emit `radios: null` or empty
+    // albums/tracks collections when Deezer has no data for them.
+    const payload = {
+      version: API_VERSION,
+      type: "genre",
+      genre: normalizeGenre(genre),
+      source: "deezer_public_chart",
+    };
+
+    if (normalizedArtists.data.length || normalizedArtists.total > 0) payload.artists = normalizedArtists;
+    if (normalizedAlbums.data.length || normalizedAlbums.total > 0) payload.albums = normalizedAlbums;
+    if (normalizedTracks.length || Number(chart?.tracks?.total) > 0) {
+      payload.tracks = {
+        data: normalizedTracks,
+        total: Number(chart?.tracks?.total) || normalizedTracks.length,
+      };
+    }
+
+    return catalogResponseForRequest(payload, 200, 300, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "radio") {
-    const id = subSegment || requestUrl.searchParams.get("id");
-    if (!id) return apiErrorResponse("Missing radio id parameter", 400, null, env);
-    const result = await publicApi(`radio/${encodeURIComponent(id)}`, {}, env, apiToken, clientIp);
-    return catalogResponse({ version: API_VERSION, data: normalizeRadio(result) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    const id = subSegment || requestUrl.searchParams.get("id") || requestUrl.searchParams.get("track_id");
+    const isrc = requestUrl.searchParams.get("isrc") || requestUrl.searchParams.get("i");
+    const query = requestUrl.searchParams.get("q") || requestUrl.searchParams.get("query") || requestUrl.searchParams.get("s");
+    const title = requestUrl.searchParams.get("title") || requestUrl.searchParams.get("track") || requestUrl.searchParams.get("song");
+    const artist = requestUrl.searchParams.get("artist");
+    const trackMode = Boolean(isrc || query || title || artist || (id && /^\d+$/.test(String(id)) && requestUrl.searchParams.get("mode") !== "catalog") || requestUrl.searchParams.get("mode") === "track" || requestUrl.searchParams.get("radio") === "track");
+    if (trackMode) {
+      if (!id && !isrc && !query && !title && !artist) return apiErrorResponse("Missing track seed for radio", 400, null, env);
+      const payload = await generatedSimilarityPayload(requestUrl, env, apiToken, clientIp, preferExplicit, limit, offset, { id, isrc, query, title, artist }, "track_radio", deviceCredential);
+      return catalogResponseForRequest(payload, 200, 30, env, apiToken, clientIp, userAgentHash);
+    }
+    if (!id) {
+      const result = await publicApi("radio", { limit, index: offset }, env);
+      return catalogResponseForRequest({ version: API_VERSION, type: "radios", ...normalizeCollection(result, normalizeRadio) }, 200, 120, env, apiToken, clientIp, userAgentHash);
+    }
+    const radio = await publicApi(`radio/${encodeURIComponent(id)}`, {}, env);
+    const tracks = await publicApi(`radio/${encodeURIComponent(id)}/tracks`, { limit, index: offset }, env).catch(() => null);
+    return catalogResponseForRequest({ version: API_VERSION, type: "radio", data: normalizeRadio(radio), tracks: tracks ? normalizeCollection(tracks, t => normalizeTrack(t, requestUrl.origin, apiToken)) : null }, 200, 120, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "recommendations") {
     if (envBoolean(env, "DISABLE_RECOMMENDATIONS", false)) {
       return apiErrorResponse("Recommendations are disabled on this instance", 404, { endpoint: "/recommendations" }, env);
     }
-    if (subSegment || requestUrl.searchParams.has("id") || requestUrl.searchParams.has("user_id")) {
-      return apiErrorResponse("Recommendations only supports the raw /recommendations route; id and user_id are not supported.", 400, {
+
+    const recommendationId = subSegment || requestUrl.searchParams.get("id") || requestUrl.searchParams.get("track_id");
+    const recommendationIsrc = requestUrl.searchParams.get("isrc") || requestUrl.searchParams.get("i");
+    const recommendationQuery = requestUrl.searchParams.get("q") || requestUrl.searchParams.get("query") || requestUrl.searchParams.get("s");
+    const recommendationTitle = requestUrl.searchParams.get("title") || requestUrl.searchParams.get("track") || requestUrl.searchParams.get("song");
+    const recommendationArtist = requestUrl.searchParams.get("artist");
+
+    if (requestUrl.searchParams.has("user_id") && !recommendationId && !recommendationIsrc && !recommendationQuery && !recommendationTitle && !recommendationArtist) {
+      const result = await getPersonalizedRecommendations(env, null, limit, offset, requestUrl.searchParams.get("user_id"));
+      const streamData = Array.isArray(result.data)
+        ? result.data.map(track => ({
+            ...track,
+            streamUrl: buildTrackStreamUrl(requestUrl.origin, track?.id, apiToken, deviceCredential, env),
+          }))
+        : [];
+      return catalogResponseForRequest({
+        version: API_VERSION,
+        type: "tracks",
+        personalized: true,
+        ...result,
+        data: streamData,
+      }, 200, 30, env, apiToken, clientIp, userAgentHash);
+    }
+
+    const hasSeed = Boolean(recommendationId || recommendationIsrc || recommendationQuery || recommendationTitle || recommendationArtist);
+    if (!hasSeed && !requestUrl.searchParams.has("user_id")) {
+      const result = await getPersonalizedRecommendations(env, null, limit, offset, null);
+      const streamData = Array.isArray(result.data)
+        ? result.data.map(track => ({
+            ...track,
+            streamUrl: buildTrackStreamUrl(requestUrl.origin, track?.id, apiToken, deviceCredential, env),
+          }))
+        : [];
+      return catalogResponseForRequest({
+        version: API_VERSION,
+        type: "tracks",
+        personalized: true,
+        ...result,
+        data: streamData,
+      }, 200, 30, env, apiToken, clientIp, userAgentHash);
+    }
+
+    if (requestUrl.searchParams.has("user_id")) {
+      return apiErrorResponse("user_id cannot be combined with song-based recommendations", 400, {
         endpoint: "/recommendations",
-        supported_parameters: ["limit", "offset", "index"],
+        supported_parameters: ["id", "q", "isrc", "title", "artist", "limit", "offset", "index"],
       }, env);
     }
 
-    const result = await getPersonalizedRecommendations(env, null, limit, offset, null);
+    const queryForAlt = recommendationQuery || recommendationTitle || recommendationArtist || recommendationId || recommendationIsrc || "";
+    const queryAllowsAlt = isAltAllowed(requestUrl, queryForAlt, env, apiToken, clientIp);
+    const result = await getSimilarRecommendations({
+      id: recommendationId,
+      isrc: recommendationIsrc,
+      query: recommendationQuery,
+      title: recommendationTitle,
+      artist: recommendationArtist,
+    }, env, apiToken, clientIp, queryAllowsAlt, preferExplicit, limit, offset);
+
     const streamData = Array.isArray(result.data)
       ? result.data.map(track => ({
           ...track,
-          streamUrl: buildTrackStreamUrl(requestUrl.origin, track?.id, apiToken),
+          streamUrl: buildTrackStreamUrl(requestUrl.origin, track?.id, apiToken, deviceCredential, env),
         }))
       : [];
 
-    return catalogResponse({
+    return catalogResponseForRequest({
       version: API_VERSION,
       type: "tracks",
-      personalized: true,
-      ...result,
+      personalized: false,
+      similar_to: result.seed,
+      seed_id: result.seed_id,
+      source: result.source,
+      total: result.total,
+      next: result.next,
+      previous: result.previous,
       data: streamData,
     }, 200, 30, env, apiToken, clientIp, userAgentHash);
   }
 
   if (rootSegment === "cover") {
-    const raw = subSegment || requestUrl.searchParams.get("url") || requestUrl.searchParams.get("hash") || requestUrl.searchParams.get("id");
+    const rawUrl = subSegment || requestUrl.searchParams.get("url") || requestUrl.searchParams.get("hash");
+    const rawId = requestUrl.searchParams.get("id") || requestUrl.searchParams.get("track_id");
+    const isrc = requestUrl.searchParams.get("isrc") || requestUrl.searchParams.get("i");
+    const query = requestUrl.searchParams.get("q") || requestUrl.searchParams.get("query") || requestUrl.searchParams.get("s");
     const type = requestUrl.searchParams.get("type") === "artist" ? "artist" : "cover";
-    const artwork = buildArtworkUrls(raw, type);
-    if (!artwork) return apiErrorResponse("Missing or invalid artwork hash/url", 400, null, env);
-    return catalogResponse({ version: API_VERSION, type, data: artwork }, 200, 86400, env, apiToken, clientIp, userAgentHash);
+    if (rawUrl) {
+      const artwork = buildArtworkUrls(rawUrl, type);
+      if (!artwork) return apiErrorResponse("Invalid artwork hash/url", 400, null, env);
+      return catalogResponseForRequest({ version: API_VERSION, type, data: artwork }, 200, 86400, env, apiToken, clientIp, userAgentHash);
+    }
+    if (type === "artist" && rawId) {
+      const artistData = await publicApi(`artist/${encodeURIComponent(rawId)}`, {}, env);
+      const artwork = buildArtworkUrls(artistData?.picture_xl || artistData?.picture || artistData?.picture_medium || artistData?.picture_small, "artist");
+      if (!artwork) return apiErrorResponse("Artist artwork not found", 404, { id: rawId }, env);
+      return catalogResponseForRequest({ version: API_VERSION, type: "artist", id: String(rawId), data: artwork }, 200, 86400, env, apiToken, clientIp, userAgentHash);
+    }
+    if (rawId || isrc || query) {
+      const track = await discoverTrack({ id: rawId, isrc, query }, env, allowAlt, preferExplicit);
+      if (!track?.id) return apiErrorResponse("Track not found", 404, null, env);
+      const source = track.album?.cover_xl || track.album?.cover || track.md5_image || track.album?.md5_image;
+      const artwork = buildArtworkUrls(source, "cover");
+      if (!artwork) return apiErrorResponse("Track artwork not found", 404, { id: track.id }, env);
+      return catalogResponseForRequest({ version: API_VERSION, type: "cover", track_id: String(track.id), data: artwork }, 200, 86400, env, apiToken, clientIp, userAgentHash);
+    }
+    return apiErrorResponse("Missing artwork hash/url or track identifier", 400, { supported_parameters: ["url", "hash", "id", "track_id", "isrc", "q", "type"] }, env);
   }
 
   return null;
+}
+
+
+function getTestRoutingPresentedKey(requestUrl) {
+  const direct = requestUrl.searchParams.get("api_key")?.trim() || requestUrl.searchParams.get("key")?.trim();
+  if (direct) return direct;
+  const pathMatch = requestUrl.pathname.match(/^\/testRouting(?:s)?&api_key=(.+)$/i);
+  return pathMatch ? decodeURIComponent(pathMatch[1]).trim() : "";
+}
+
+function isTestRoutingsPath(requestUrl) {
+  const path = requestUrl.pathname.replace(/\/+$/, "") || "/";
+  return /^\/testRouting(?:s)?(?:\/run)?$/i.test(path) || /^\/testRouting(?:s)?&api_key=.+$/i.test(path);
+}
+
+function authenticateTestRoutings(requestUrl, env) {
+  const { mappings } = getMemoizedConfig(env);
+  const publicApi = String(env?.PUBLIC_API ?? "false").toLowerCase() === "true";
+  const token = getTestRoutingPresentedKey(requestUrl);
+  if (publicApi && mappings.size === 0) return { authorized: true, tokenId: token || "public", allowedSlots: null };
+  if (!token || !mappings.has(token)) return { authorized: false, tokenId: null, allowedSlots: null };
+  return { authorized: true, tokenId: token, allowedSlots: mappings.get(token) };
+}
+
+function testRoutingErrorDetails(error, fallbackStatus = 502) {
+  const status = Number(error?.status || error?.errorNumber || fallbackStatus);
+  const upstreamCode = error?.upstreamCode || error?.code || null;
+  const message = error?.upstreamMessage || error?.message || String(error || "Unknown error");
+  return {
+    errorNumber: Number.isFinite(status) && status > 0 ? status : fallbackStatus,
+    errorCode: upstreamCode,
+    errorText: String(message).slice(0, 1000),
+  };
+}
+
+function makeTestRoutingLine(text = "") {
+  return `${new Date().toISOString()}  ${String(text)}\n`;
+}
+
+function buildTestRoutingsHtml(requestUrl, env, apiKey) {
+  const safeVersion = String(API_VERSION).replace(/[^0-9A-Za-z._-]/g, "");
+  const origin = requestUrl.origin;
+  const encodedKey = btoa(unescape(encodeURIComponent(String(apiKey || ""))));
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Worker Routing Diagnostics</title>
+<style>
+:root{color-scheme:dark;--bg:#07090d;--panel:#0b0f15;--line:#202936;--muted:#778397;--text:#e8edf5;--key:#8bd5ff;--ok:#78e6a0;--bad:#ff7e8b;--warn:#f3d36b;--input:#0e141d}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text)}body{font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}main{width:min(100%,1050px);margin:0 auto;padding:18px}.json{border:1px solid var(--line);background:var(--panel);border-radius:12px;overflow:hidden;box-shadow:0 18px 60px #0008}.bar{display:flex;align-items:center;justify-content:space-between;padding:12px 15px;border-bottom:1px solid var(--line);background:#0e131b}.title{font-weight:700}.version{color:var(--muted);font-size:12px}.body{padding:16px}.brace{color:#aeb8c8;font-weight:700}.key{color:var(--key)}.string{color:#c9d1dc}.bool{color:#d4a7ff}.number{color:#9bd7ff}.comment{color:#667286}.warning{margin:8px 0 14px;padding:12px 13px;border-left:3px solid var(--warn);background:#16150d;color:#e8dcaa;white-space:pre-wrap}.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}.inputwrap{display:flex;align-items:center;gap:7px;min-width:0}.inputwrap .prefix,.inputwrap .suffix{color:#8995a7}.input{min-width:250px;max-width:100%;font:inherit;color:#dfe7f2;background:var(--input);border:1px solid #2a3545;border-radius:7px;padding:7px 9px;outline:none}.input:focus{border-color:#587b99;box-shadow:0 0 0 2px #4c759022}.btn{font:inherit;color:#dfe7f2;background:#111822;border:1px solid #2b3747;border-radius:7px;padding:7px 12px;cursor:pointer}.btn:hover{background:#17202c;border-color:#405066}.btn:active{transform:translateY(1px)}.btn.y{color:var(--ok)}.btn.n{color:var(--bad)}.hidden{display:none!important}.terminal{height:58vh;min-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:13px 14px;margin:12px 0;border:1px solid #1e2733;border-radius:8px;background:#06080c;scroll-behavior:auto}.line{min-height:1.55em}.ok{color:var(--ok)}.fail{color:var(--bad)}.dim{color:var(--muted)}.warn{color:var(--warn)}.prompt{margin:8px 0;color:#aeb8c8}.status{color:#9eabbc;margin-top:8px}.field{padding-left:22px}.field+.field{margin-top:2px}.comma{color:#667286}.cursor{display:inline-block;width:8px;height:15px;background:#8bd5ff;vertical-align:-2px;margin-left:2px;animation:blink 1s steps(2,start) infinite}@keyframes blink{50%{opacity:0}}
+@media(max-width:600px){main{padding:8px}.body{padding:11px}.input{min-width:180px;width:100%}.inputwrap{width:100%}.terminal{height:60vh;min-height:300px}}
+</style></head><body><main><section class="json"><div class="bar"><span class="title">cfw-deezer-hifi-api /testRoutings</span><span class="version">v${safeVersion}</span></div><div class="body">
+<div class="brace">{</div>
+<div class="field"><span class="key">"diagnostics"</span>: {</div>
+<div class="field"><span class="key">"interactive"</span>: <span class="bool">true</span>,</div>
+<div class="field"><span class="key">"streaming"</span>: <span class="bool">true</span>,</div>
+<div class="field"><span class="key">"description"</span>: <span class="string">"Full worker + /routing diagnostics"</span>,</div>
+
+<div class="field">}</div>
+<div class="brace">,</div>
+<div id="terminal" class="terminal" role="log" aria-live="polite"></div>
+<div id="done" class="status">"status": "starting"</div>
+<div class="brace">}</div>
+</div></section></main>
+<script>
+const origin=${JSON.stringify(origin)};
+const suppliedKey=decodeURIComponent(escape(atob(${JSON.stringify(encodedKey)})));
+const trackId="920991742";
+const terminal=document.getElementById('terminal');
+const done=document.getElementById('done');
+const append=(text,cls='')=>{const d=document.createElement('div');d.className='line '+cls;d.textContent=text;terminal.appendChild(d);terminal.scrollTop=terminal.scrollHeight;};
+const classify=line=>line.includes('FAIL')?'fail':line.includes('PASS')?'ok':line.includes('WARN')?'warn':line.includes('SKIP')?'dim':'';
+async function runPhase(phase){
+  append(''); append('{','dim'); append('  "phase": "'+phase+'",','dim'); append('  "status": "running",','dim'); append('  "track_id": '+trackId+',','dim'); append('  "output": [','dim');
+  const u=new URL(origin+'/testRoutings/run'); u.searchParams.set('phase',phase); u.searchParams.set('api_key',suppliedKey); u.searchParams.set('track_id',trackId);
+  try{
+    const r=await fetch(u.toString(),{cache:'no-store',headers:{'Accept':'text/plain'}});
+    if(!r.ok){append('    '+JSON.stringify('HTTP '+r.status+' while starting diagnostics'),'fail'); append('  ]','dim'); append('  "status": "failed"','fail'); append('}','dim'); return false;}
+    if(!r.body){append('    '+JSON.stringify('Diagnostic stream unavailable'),'fail'); append('  ]','dim'); append('  "status": "failed"','fail'); append('}','dim'); return false;}
+    const reader=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    while(true){
+      const {value,done:streamDone}=await reader.read();
+      if(streamDone) break;
+      buf+=dec.decode(value,{stream:true});
+      const parts=buf.split('\n'); buf=parts.pop()||'';
+      for(const line of parts){
+        if(!line) continue;
+        if(line==='@@CONTINUE@@' || line==='@@DONE@@'){append('  ]','dim'); append('  "status": "complete"','ok'); append('}','dim'); return true;}
+        append('    '+JSON.stringify(line),classify(line));
+      }
+    }
+    if(buf) append('    '+JSON.stringify(buf),classify(buf));
+    append('  ]','dim'); append('  "status": "complete"','ok'); append('}','dim'); return true;
+  }catch(e){
+    append('    '+JSON.stringify('CLIENT_ERROR: '+(e?.message||String(e))),'fail'); append('  ]','dim'); append('  "status": "failed"','fail'); append('}','dim'); return false;
+  }
+}
+(async()=>{
+  done.textContent='"status": "running"';
+  append('cfw-deezer-hifi-api diagnostics starting...','dim');
+  append('Track ID: '+trackId,'dim');
+  append('Testing all configured ARLs and then every diagnostic route...','dim');
+  const arls=await runPhase('arls');
+  if(arls){ append(''); append('ARL phase complete. Automatically starting full /routing/ diagnostics...','ok'); await runPhase('routes'); }
+  done.textContent=arls?'"status": "complete"':'"status": "failed"';
+})();
+</script></body></html>`;
+}
+async function streamTestRoutingsResponse(request, env, requestUrl, phase, trackId, apiKey, allowedSlots) {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      const write = (text) => controller.enqueue(encoder.encode(makeTestRoutingLine(text)));
+      const writeRaw = (text) => controller.enqueue(encoder.encode(`${text}\n`));
+      try {
+        write(`=== cfw-deezer-hifi-api ${API_VERSION} diagnostics ===`);
+        write(`Phase: ${phase}`);
+        if (phase === "arls") {
+          if (!/^\d+$/.test(String(trackId || ""))) throw Object.assign(new Error("A numeric Deezer Track ID is required"), { status: 400, code: "INVALID_TRACK_ID" });
+          write(`Track ID: ${trackId}`);
+          write("Testing every permitted Deezer ARL: session validity + highest media quality...");
+          const { arls } = getMemoizedConfig(env);
+          const configured = allowedSlots && allowedSlots.size > 0 ? arls.filter(x => allowedSlots.has(x.slot)) : arls;
+          if (!configured.length) throw Object.assign(new Error("No DEEZER_ARL slots are available to this API key"), { status: 503, code: "NO_ARL_SLOTS" });
+          let activeCount = 0;
+          for (const item of configured) {
+            const started = Date.now();
+            write(`-- ARL slot ${item.slot} (${item.name}) --`);
+            try {
+              const session = await getOrRenewSession(item.value, env, false);
+              let trackData = await getTrackTokens(item.value, session, String(trackId), env);
+              if (!trackData?.TRACK_TOKEN) {
+                session.createdAt = 0;
+                trackData = await getTrackTokens(item.value, await getOrRenewSession(item.value, env, true), String(trackId), env);
+              }
+              if (!trackData?.TRACK_TOKEN) throw Object.assign(new Error("Deezer did not return TRACK_TOKEN for this ARL/track"), { status: 502, code: "TRACK_TOKEN_MISSING" });
+              const attempts = ["FLAC", "MP3_320", "MP3_128"];
+              let highest = null;
+              const qualityErrors = [];
+              for (const format of attempts) {
+                try {
+                  const media = await resolveMediaStream(session.licenseToken, trackData.TRACK_TOKEN, format, env);
+                  const actual = String(media?.format || format).toUpperCase();
+                  highest = actual;
+                  write(`  ${format.padEnd(8)} PASS -> ${actual}`);
+                  break;
+                } catch (err) {
+                  const d = testRoutingErrorDetails(err, 502);
+                  qualityErrors.push({ format, ...d });
+                  write(`  ${format.padEnd(8)} FAIL -> ${d.errorText} [${d.errorNumber}]`);
+                }
+              }
+              activeCount++;
+              const tier = highest === "FLAC" ? "LOSSLESS / FLAC" : highest === "MP3_320" ? "320 kbps MP3" : highest === "MP3_128" ? "128 kbps MP3" : "NO MEDIA";
+              write(`  RESULT: ACTIVE | highest=${tier} | sessionFlags: lossless=${String(session.canLossless)} 320=${String(session.can320)} | ${Date.now()-started}ms`);
+              if (!highest) write(`  FAIL: ARL active but no playable quality was returned for this track.`, "fail");
+            } catch (err) {
+              const d = testRoutingErrorDetails(err, 502);
+              write(`  RESULT: FAILED | errorText=${d.errorText} | errorNumber=${d.errorNumber} | errorCode=${d.errorCode || "n/a"}`);
+            }
+          }
+          write(`=== ARL SUMMARY: ${activeCount}/${configured.length} active ===`);
+          writeRaw("@@CONTINUE@@");
+          controller.close();
+          return;
+        }
+
+        if (phase !== "routes") throw Object.assign(new Error("Unknown diagnostic phase"), { status: 400, code: "INVALID_PHASE" });
+        if (!/^\d+$/.test(String(trackId || ""))) throw Object.assign(new Error("A numeric Deezer Track ID is required"), { status: 400, code: "INVALID_TRACK_ID" });
+        write(`Track ID: ${trackId}`);
+        write("Resolving seed track and derived artist/album IDs...");
+        const seed = await discoverTrack({ id: String(trackId) }, env, true, true);
+        if (!seed?.id) throw Object.assign(new Error("Could not resolve the supplied Deezer Track ID"), { status: 404, code: "TRACK_NOT_FOUND" });
+        const albumId = seed?.album?.id || seed?.ALB_ID || null;
+        const artistId = seed?.artist?.id || seed?.ART_ID || null;
+        const searchText = `${seed?.title || ""} ${seed?.artist?.name || ""}`.trim() || String(trackId);
+        write(`Seed PASS: ${seed.title || "Unknown"}${seed.artist?.name ? ` — ${seed.artist.name}` : ""}`);
+        write(`Derived album=${albumId || "n/a"} artist=${artistId || "n/a"}`);
+
+        const base = new URL("https://diagnostic.invalid");
+        const tests = [
+          ["/", async()=>({status:200, value:buildRootStatus(env)})],
+          ["/info-api", async()=>({status:200, value:{ok:true}})],
+          ["/routing", async()=>({status:200, value:routingInfo(env)})],
+          ["/docs", async()=>({status:200, value:buildDocs(base, env)})],
+          ["/testRouting alias", async()=>({status:isTestRoutingsPath(new URL("https://diagnostic.invalid/testRouting")) ? 200 : 500, value:{aliases:["/testRoutings","/testRouting"], accepted:true}})],
+          ["/recommendations?q="+encodeURIComponent(searchText), async()=>handleCatalogRoute(new URL(`/recommendations?q=${encodeURIComponent(searchText)}`, base), env, ["recommendations"], apiKey, "diagnostic", null)],
+          ["/recommendations?isrc="+(seed?.isrc || seed?.ISRC || "n/a"), async()=>{
+            const seedIsrc=String(seed?.isrc || seed?.ISRC || "").trim();
+            if (!seedIsrc) return {status:204, value:{skipped:"seed has no ISRC"}};
+            return handleCatalogRoute(new URL(`/recommendations?isrc=${encodeURIComponent(seedIsrc)}`, base), env, ["recommendations"], apiKey, "diagnostic", null);
+          }],
+          ["/ping", async()=>{
+            const {arls}=getMemoizedConfig(env);
+            const configured=allowedSlots&&allowedSlots.size>0?arls.filter(x=>allowedSlots.has(x.slot)):arls;
+            const results=[];
+            for(const item of configured){
+              try {
+                const session=sessionCache.get(item.value)||await getOrRenewSession(item.value,env);
+                results.push({slot:item.slot,name:item.name,status:"active",userId:String(session.userId||""),canLossless:session.canLossless===true,can320:session.can320===true});
+              } catch(error) {
+                const details=testRoutingErrorDetails(error,502);
+                results.push({slot:item.slot,name:item.name,status:"failed",errorNumber:details.errorNumber,errorText:details.errorText,errorCode:details.errorCode||null});
+              }
+            }
+            const active=results.filter(x=>x.status==="active");
+            if(!active.length) throw Object.assign(new Error("No active ARL sessions"),{status:503,code:"NO_ACTIVE_ARLS",details:results});
+            return {status:200,value:{checked:results.length,active:active.length,failed:results.length-active.length,slots:results}};
+          }],
+          ["/info?id="+trackId, async()=>handleCatalogRoute(new URL(`/info?id=${trackId}`, base), env, ["info"], apiKey, "diagnostic", null)],
+          ["/search?q="+encodeURIComponent(searchText), async()=>handleCatalogRoute(new URL(`/search?q=${encodeURIComponent(searchText)}`, base), env, ["search"], apiKey, "diagnostic", null)],
+          ["/track?id="+trackId, async()=>{const t=await discoverTrack({id:String(trackId)},env,true,true);if(!t?.id)throw Object.assign(new Error("Track metadata could not be resolved"),{status:404,code:"TRACK_NOT_FOUND"});const r=await resolvePlaybackStreamOnly(String(trackId),"best",env,allowedSlots);return {status:200,value:{id:t.id,format:r.mediaResult?.format}};}],
+          ["/playlist?id="+trackId, async()=>handleCatalogRoute(new URL(`/playlist?id=${trackId}`, base), env, ["playlist"], apiKey, "diagnostic", null)],
+          ["/radio?id="+trackId, async()=>handleCatalogRoute(new URL(`/radio?id=${trackId}`, base), env, ["radio"], apiKey, "diagnostic", null)],
+          ["/recommendations?id="+trackId, async()=>handleCatalogRoute(new URL(`/recommendations?id=${trackId}`, base), env, ["recommendations"], apiKey, "diagnostic", null)],
+          ["/cover?id="+trackId, async()=>handleCatalogRoute(new URL(`/cover?id=${trackId}`, base), env, ["cover"], apiKey, "diagnostic", null)],
+          ["/lyrics?id="+trackId, async()=>{const pools=await getCandidatePools(env, allowedSlots);const session=pickAuxiliarySession(pools,env)||pools.lossless[0]?.session||pools.lossy[0]?.session;if(!session) throw Object.assign(new Error("No session for lyrics"),{status:503,code:"LYRICS_SESSION_UNAVAILABLE"});const lyrics=await getDeezerLyrics(session,String(trackId),env);if(!lyrics) return {status:204,value:{skipped:"lyrics not available for diagnostic track",code:"LYRICS_NOT_FOUND"}};return {status:200,value:{hasWordSync:Boolean(lyrics.hasWordSync)}};}],
+          ["/chart?type=tracks", async()=>handleCatalogRoute(new URL("/chart?type=tracks", base), env, ["chart"], apiKey, "diagnostic", null)],
+          ["/genre?id=132", async()=>handleCatalogRoute(new URL("/genre?id=132", base), env, ["genre"], apiKey, "diagnostic", null)],
+          ["/genre", async()=>handleCatalogRoute(new URL("/genre", base), env, ["genre"], apiKey, "diagnostic", null)],
+        ];
+        if (deviceBoundStreamsEnabled(env)) {
+          tests.push(["/device", async()=>{
+            const credential=await registerDeviceCredential(apiKey, env);
+            if (!credential) throw Object.assign(new Error("Device signing is enabled but no credential could be registered"),{status:503,code:"DEVICE_SIGNING_NOT_CONFIGURED"});
+            const verified=await verifyDeviceCredential(credential, apiKey, env);
+            if (!verified?.valid || !verified?.id) throw Object.assign(new Error("Generated device credential failed verification"),{status:500,code:"DEVICE_CREDENTIAL_SELF_TEST_FAILED"});
+            return {status:200,value:{enabled:true,valid:true,device_id:verified.id,expires_at:verified.payload?.exp||null}};
+          }]);
+        } else {
+          write("SKIP  /device  DEVICE_BOUND_SIGNED_STREAMS=false");
+        }
+
+        if (albumId) {
+          tests.push([`/album?id=${albumId}`, async()=>handleCatalogRoute(new URL(`/album?id=${albumId}`, base), env, ["album"], apiKey, "diagnostic", null)]);
+          tests.push([`/album/${albumId}/tracks`, async()=>handleCatalogRoute(new URL(`/album/${albumId}/tracks`, base), env, ["album",String(albumId),"tracks"], apiKey, "diagnostic", null)]);
+        } else {
+          write("/album: SKIP (seed did not expose an album id)");
+        }
+        if (artistId) {
+          tests.push([`/artist?id=${artistId}`, async()=>handleCatalogRoute(new URL(`/artist?id=${artistId}`, base), env, ["artist"], apiKey, "diagnostic", null)]);
+          tests.push([`/artist/${artistId}/top`, async()=>handleCatalogRoute(new URL(`/artist/${artistId}/top`, base), env, ["artist",String(artistId),"top"], apiKey, "diagnostic", null)]);
+          tests.push([`/artist/${artistId}/albums`, async()=>handleCatalogRoute(new URL(`/artist/${artistId}/albums`, base), env, ["artist",String(artistId),"albums"], apiKey, "diagnostic", null)]);
+        } else {
+          write("/artist: SKIP (seed did not expose an artist id)");
+        }
+
+        let playback = null;
+        for (const [label, fn] of tests) {
+          const started = Date.now();
+          try {
+            const result = await fn();
+            const status = result?.status || 200;
+            if (status >= 400) {
+              let body = null;
+              if (result instanceof Response) {
+                try { body = await result.clone().json(); } catch (_) {}
+              }
+              const d = { errorNumber: status, errorCode: body?.code || body?.error || null, errorText: body?.message || body?.errorText || body?.details?.message || `HTTP ${status}` };
+              write(`FAIL  ${label}  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}  ${Date.now()-started}ms`);
+            } else if (status === 204 || result?.value?.skipped) {
+              write(`SKIP  ${label}  ${result?.value?.skipped || "diagnostic skipped"}  ${Date.now()-started}ms`);
+            } else {
+              write(`PASS  ${label}  ${Date.now()-started}ms`);
+            }
+          } catch (err) {
+            const d = testRoutingErrorDetails(err, 502);
+            write(`FAIL  ${label}  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}  ${Date.now()-started}ms`);
+          }
+        }
+
+        const playbackStarted = Date.now();
+        try {
+          playback = await resolvePlaybackStreamOnly(String(trackId), "best", env, allowedSlots);
+          write(`PASS  /stream-track?id=${trackId}  resolved ${playback.selectedProfile?.label || playback.mediaResult?.format || "media"} via ARL slot ${playback.slot}  ${Date.now()-playbackStarted}ms`);
+          write(`PASS  /track/${trackId}/stream  playback resolver verified  ${Date.now()-playbackStarted}ms`);
+          write(`PASS  /stream  CDN media source verified; full decrypt is intentionally not consumed by diagnostics to avoid downloading audio.`);
+        } catch (err) {
+          const d = testRoutingErrorDetails(err, 502);
+          write(`FAIL  /stream-track?id=${trackId}  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`);
+          write(`FAIL  /track/${trackId}/stream  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`);
+          write(`FAIL  /stream  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`);
+        }
+
+        const adminKey = String(env?.ADMIN_API_KEY || "").trim();
+        if (adminKey && apiKey === adminKey) {
+          write("PASS  /env  admin key supplied by test API key");
+        } else {
+          write("SKIP  /env  requires ADMIN_API_KEY; the diagnostic only has the client API key");
+        }
+        write(`Diagnostic contract: /testRoutings and /testRouting are accepted aliases.`);
+        write(`=== ROUTING TEST COMPLETE ===`);
+        writeRaw("@@DONE@@");
+      } catch (error) {
+        const d = testRoutingErrorDetails(error, 502);
+        write(`FATAL FAIL  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`);
+        writeRaw("@@DONE@@");
+      } finally {
+        controller.close();
+      }
+    }
+  });
+  return new Response(stream, { status: 200, headers: { ...getCorsHeaders(env), "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", "X-Accel-Buffering": "no" } });
+}
+
+async function runTestRoutingsJson(request, env, requestUrl, trackId, apiKey, allowedSlots) {
+  const phases = [];
+  const run = async (phase) => {
+    const phaseResponse = await streamTestRoutingsResponse(request, env, requestUrl, phase, trackId, apiKey, allowedSlots);
+    const raw = await phaseResponse.text();
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const output = [];
+    let status = "complete";
+    let sawFatal = false;
+    let sawArlFailure = false;
+    for (const line of lines) {
+      const match = line.match(/^\d{4}-\d{2}-\d{2}T[^ ]+\s{2}(.*)$/);
+      const text = match ? match[1] : line;
+      if (text === "@@CONTINUE@@" || text === "@@DONE@@") continue;
+      if (/FATAL FAIL/.test(text)) sawFatal = true;
+      if (/^\s*RESULT:\s+FAILED\b/.test(text)) sawArlFailure = true;
+      if (phase !== "arls" && /\bFAIL\b/.test(text)) sawFatal = true;
+      output.push(text);
+    }
+    if (sawFatal || sawArlFailure) status = "failed";
+    phases.push({ phase, status, output });
+    return status === "complete";
+  };
+
+  const startedAt = new Date().toISOString();
+  let overallStatus = "complete";
+  try {
+    if (!/^\d+$/.test(String(trackId || ""))) {
+      return {
+        diagnostics: "testRoutings",
+        version: API_VERSION,
+        status: "failed",
+        track_id: String(trackId || ""),
+        started_at: startedAt,
+        errorNumber: 400,
+        errorCode: "INVALID_TRACK_ID",
+        errorText: "A numeric Deezer Track ID is required",
+        phases: []
+      };
+    }
+    const arlOk = await run("arls");
+    if (!arlOk) overallStatus = "failed";
+    const routesOk = await run("routes");
+    if (!routesOk) overallStatus = "failed";
+  } catch (error) {
+    const d = testRoutingErrorDetails(error, 502);
+    overallStatus = "failed";
+    phases.push({ phase: "fatal", status: "failed", output: [`FATAL FAIL [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`], error: d });
+  }
+
+  const routePhase = phases.find(x => x.phase === "routes");
+  const routeOutput = routePhase?.output || [];
+  const passCount = routeOutput.filter(x => /^PASS\s/.test(x)).length;
+  const failCount = routeOutput.filter(x => /\bFAIL\b/.test(x)).length;
+  const skipCount = routeOutput.filter(x => /^SKIP\s/.test(x)).length;
+
+  return {
+    diagnostics: "testRoutings",
+    version: API_VERSION,
+    status: overallStatus,
+    track_id: String(trackId),
+    started_at: startedAt,
+    completed_at: new Date().toISOString(),
+    phases,
+    summary: {
+      arls_tested: phases.find(x => x.phase === "arls")?.output.filter(x => /^-- ARL slot /.test(x)).length || 0,
+      routes_passed: passCount,
+      routes_failed: failCount,
+      routes_skipped: skipCount,
+      routes_tested: passCount + failCount + skipCount
+    }
+  };
 }
 
 function makeRequestId() {
@@ -2878,7 +3926,7 @@ function getPresentedApiToken(request, env) {
   return (m ? m[1] : h).trim();
 }
 
-const STREAM_TOKEN_SECURITY_NOTE = "Bootstrap stream tokens begin with a fresh 64-character SHA-256 hash of 256-bit cryptographically random bytes, followed by the signed payload and HMAC-SHA-256 signature. Every emitted bootstrap URL gets a new nonce; bootstrap credentials are never coalesced or cached. Authenticated playback entry points require the bootstrap token by default, and optional Durable Object coordination makes token consumption globally atomic. The random nonce is not a secret by itself and never replaces signature validation.";
+const STREAM_TOKEN_SECURITY_NOTE = "Bootstrap stream tokens use a fresh 256-bit cryptographically random nonce plus an HMAC-SHA-256 signed payload. Every emitted bootstrap URL gets a new nonce and token generation is never coalesced. Authenticated playback entry points can require a valid signed bootstrap token by default. DEVICE_BOUND_SIGNED_STREAMS adds a long-lived signed device credential and binds playback sessions/tokens to its hash, so copied stream URLs are not independently playable.";
 
 const ENVIRONMENT_VARIABLES = {
   CORS_ALLOW_ORIGIN: "Allowed CORS origin; defaults to *.",
@@ -2901,19 +3949,24 @@ const ENVIRONMENT_VARIABLES = {
   LICENSE_TOKEN_TTL_MINUTES: "Controls the freshness threshold used for Deezer license/session handling; clamped to 10-55 minutes.",
   MEDIA_RESOLUTION_TIMEOUT_MS: "Timeout for Deezer media URL resolution; clamped to 2000-20000 ms.",
   MEDIA_REAUTH_RETRIES: "Number of media-auth retry/reauth attempts; clamped to 0-3.",
+  MEDIA_INFLIGHT_TTL_MS: "How long identical concurrent media-resolution requests are coalesced; defaults to 5000 ms and is clamped to 1000-30000 ms.",
+  TRACK_TOKEN_INFLIGHT_TTL_MS: "How long identical concurrent track-token requests are coalesced; defaults to 5000 ms and is clamped to 1000-30000 ms.",
   UPSTREAM_TIMEOUT_MS: "Timeout for catalog/auth/lyrics upstream requests; clamped to 1000-20000 ms.",
   STREAM_CDN_HOSTS: "Semicolon-separated HTTPS CDN host allowlist for /stream.",
-  STREAM_CHUNK_SIZE: "Default decrypted audio chunk size; clamped to 64 KiB-512 KiB.",
-  CHUNK_SIZE: "Fallback chunk-size setting when STREAM_CHUNK_SIZE is not set.",
+  STREAM_CHUNK_SIZE: "Default decrypted audio chunk size; clamped to the configured maximum.",
+  STREAM_MAX_CHUNK_SIZE_BYTES: "Hard per-request decrypted chunk ceiling; defaults to 512 KiB and is clamped to 64 KiB-1 MiB. Larger values can improve throughput but increase CPU/memory pressure.",
+  CHUNK_SIZE: "Fallback chunk-size setting when STREAM_CHUNK_SIZE is not set; still capped by STREAM_MAX_CHUNK_SIZE_BYTES.",
   STREAM_CACHE_CONTROL: "Cache-Control header emitted by /stream; defaults to private, no-store.",
   STREAM_TOKEN_SECRET: "Secret used to sign temporary playback tokens; set independently in production.",
-  STREAM_TOKEN_TTL_SECONDS: "Lifetime of the one-use bootstrap stream token; defaults to 600 seconds and is clamped to 30-3600.",
+  STREAM_TOKEN_TTL_SECONDS: "Lifetime of the temporary bootstrap stream token; defaults to 600 seconds and is clamped to 30-3600.",
   STREAM_SESSION_TTL_SECONDS: "Idle lifetime of the signed playback session cookie; defaults to 1800 seconds and is clamped to 60-7200.",
   STREAM_SESSION_REFRESH_THRESHOLD_SECONDS: "Refresh threshold for active playback sessions; defaults to 300 seconds and is clamped to 30-3600.",
   STREAM_TOKEN_BIND_USER_AGENT: "Set true to additionally bind stream tokens and playback sessions to the caller User-Agent hash.",
-  STREAM_REQUIRE_BOOTSTRAP: "Set true to require one-use bootstrap tokens for authenticated playback entry points.",
-  STREAM_TOKEN_GUARD: "Optional Durable Object namespace used for globally atomic bootstrap-token replay protection.",
-  STREAM_TOKEN_GUARD_FAIL_CLOSED: "Set true to reject bootstrap authorization if the configured Durable Object replay guard is unavailable.",
+  STREAM_REQUIRE_BOOTSTRAP: "Set true to require temporary bootstrap tokens for authenticated playback entry points.",
+  DEVICE_BOUND_SIGNED_STREAMS: "Set true to bind authenticated playback to a cryptographically signed device credential. Native clients supply it with X-Voria-Device; browsers can use the HttpOnly __Host-VoriaDevice cookie from /device. Generated authenticated streamUrl values carry api_key plus a short-lived device-bound playback token as ?device=; the long-lived d1 credential is never emitted into the URL.",
+  DEVICE_BOUND_SECRET: "Optional independent secret used to sign device credentials. If omitted, the Worker derives a separate device-signing secret from STREAM_TOKEN_SECRET or an existing secret. Set this explicitly in production for independent rotation.",
+  DEVICE_BOUND_TOKEN_TTL_SECONDS: "Lifetime of a registered device credential; defaults to 2592000 seconds (30 days) and is clamped to 3600-31536000.",
+  ALLOW_QUERY_DEVICE_SIGN: "Set true only for testing/clients that cannot send X-Voria-Device. Accepts a raw d1 device credential as ?device_credential= (and legacy d1 values in ?device=). Generated streamUrl values do NOT contain the long-lived device credential; they use ?device= for a short-lived device-bound playback token. Defaults to false.",
   GENERAL_MUSIC_CACHE: "Optional KV-style binding used for shared track/search/lyrics caching.",
   SEARCH_CACHE_TTL_SECONDS: "Shared public catalog/search cache lifetime in seconds; defaults to 30 and is clamped to 5-3600.",
   CACHE_TTL_DAYS: "Default shared-cache TTL when a cache write does not provide its own TTL; defaults to 30 days.",
@@ -2994,19 +4047,24 @@ function buildDocs(requestUrl, env) {
     LICENSE_TOKEN_TTL_MINUTES: { type: "number", secret: false, default: "45", range: "10-55", effect: "Freshness threshold for reusing a Deezer session/license context before creating a fresh gateway session." },
     MEDIA_RESOLUTION_TIMEOUT_MS: { type: "number", secret: false, default: "configured fallback", range: "2000-20000", effect: "Timeout for resolving a Deezer media URL. Values are clamped to 2-20 seconds." },
     MEDIA_REAUTH_RETRIES: { type: "number", secret: false, default: "configured fallback", range: "0-3", effect: "How many media authentication retry/reauth attempts are allowed after an authorization failure." },
+    MEDIA_INFLIGHT_TTL_MS: { type: "number", secret: false, default: "5000", range: "1000-30000", effect: "TTL for coalescing identical concurrent media URL resolution requests." },
+    TRACK_TOKEN_INFLIGHT_TTL_MS: { type: "number", secret: false, default: "5000", range: "1000-30000", effect: "TTL for coalescing identical concurrent Deezer track-token requests." },
     UPSTREAM_TIMEOUT_MS: { type: "number", secret: false, default: "8000", range: "1000-20000", effect: "Timeout for catalog, authentication, lyrics, and other bounded upstream requests." },
     STREAM_CDN_HOSTS: { type: "semicolon-separated host patterns", secret: false, default: "*.dzcdn.net;media.deezer.com", effect: "Allowlist for HTTPS upstream hosts accepted by /stream. Wildcards only work as leading *.host patterns." },
-    STREAM_CHUNK_SIZE: { type: "bytes or 256k/512k", secret: false, default: "worker safe default", range: "64 KiB-512 KiB", effect: "Default decrypted streaming chunk size. Larger chunks can improve throughput but increase per-request memory/CPU pressure." },
-    CHUNK_SIZE: { type: "bytes or 256k/512k", secret: false, default: "worker safe default", range: "64 KiB-512 KiB", effect: "Fallback chunk-size setting used only when STREAM_CHUNK_SIZE is not set." },
+    STREAM_CHUNK_SIZE: { type: "bytes or 256k/512k", secret: false, default: "worker safe default", range: "64 KiB-configured maximum", effect: "Default decrypted streaming chunk size." },
+    STREAM_MAX_CHUNK_SIZE_BYTES: { type: "number", secret: false, default: "524288", range: "65536-1048576", effect: "Hard ceiling for a single decrypted audio request. Raising it may improve throughput on fast clients while increasing per-request CPU and memory pressure." },
+    CHUNK_SIZE: { type: "bytes or 256k/512k", secret: false, default: "worker safe default", range: "64 KiB-configured maximum", effect: "Fallback chunk-size setting used only when STREAM_CHUNK_SIZE is not set." },
     STREAM_TOKEN_SECRET: { type: "secret string", secret: true, default: "falls back to ADMIN_API_KEY or the primary Deezer ARL if unset", effect: "HMAC-SHA-256 signing secret for temporary client-bound playback tokens. Set this independently in production so changing client API keys or ARLs does not change the signing key." },
-    STREAM_TOKEN_TTL_SECONDS: { type: "number", secret: false, default: "600", range: "30-3600", effect: "Lifetime of the initial generated stream_token. After successful authorization, the one-use bootstrap token is consumed and the Worker establishes a separate playback session cookie so chunked Range requests can continue after the URL token expires." },
+    STREAM_TOKEN_TTL_SECONDS: { type: "number", secret: false, default: "600", range: "30-3600", effect: "Lifetime of the generated stream_token. The token remains valid until expiration and is used to authorize the playback session." },
     STREAM_SESSION_TTL_SECONDS: { type: "number", secret: false, default: "1800", range: "60-7200", effect: "Idle playback-session lifetime. Active playback can continue beyond this through session refreshes; inactive/stolen session cookies eventually expire." },
     STREAM_SESSION_REFRESH_THRESHOLD_SECONDS: { type: "number", secret: false, default: "300", range: "30-3600", effect: "When a valid playback session has this many seconds or less remaining, the Worker silently issues a fresh signed session cookie while serving the request." },
     STREAM_TOKEN_BIND_USER_AGENT: { type: "boolean string", secret: false, default: "false", effect: "When true, temporary stream tokens and playback sessions are additionally bound to a SHA-256 hash of the caller User-Agent. This increases copy resistance for same-IP replay but may reduce compatibility with clients that use different User-Agents for metadata and audio playback." },
-    STREAM_REQUIRE_BOOTSTRAP: { type: "boolean string", secret: false, default: "true", effect: "When true, authenticated playback entry points require a valid one-use bootstrap stream_token. This prevents a copied api_key from being used to mint fresh playback sessions through /stream-track or /track/:id/stream. Public API mode remains intentionally open." },
-    STREAM_TOKEN_GUARD: { type: "Durable Object namespace binding", secret: false, default: "not bound", effect: "When bound to StreamTokenGuard, bootstrap-token consumption is globally coordinated and atomically recorded using strongly consistent Durable Object storage. Tokens are sharded across 256 deterministic objects to avoid a single global bottleneck." },
-    STREAM_TOKEN_GUARD_FAIL_CLOSED: { type: "boolean string", secret: false, default: "true", effect: "If the Durable Object replay guard is configured but unavailable, reject bootstrap authorization instead of falling back to a weaker replay guard." },
+    STREAM_REQUIRE_BOOTSTRAP: { type: "boolean string", secret: false, default: "true", effect: "When true, authenticated playback entry points require a valid temporary bootstrap stream_token. This prevents a copied api_key from being used to mint fresh playback sessions through /stream-track or /track/:id/stream. Public API mode remains intentionally open." },
     STREAM_CACHE_CONTROL: { type: "string", secret: false, default: "private, no-store", effect: "Cache-Control header emitted by the decrypted /stream response." },
+    DEVICE_BOUND_SIGNED_STREAMS: { type: "boolean string", secret: false, default: "false", effect: "When true, authenticated playback is bound to a signed device credential. Native clients use X-Voria-Device; browsers use the HttpOnly __Host-VoriaDevice cookie set by /device. Generated stream URLs use a short-lived ?device= playback token, never the long-lived d1 credential." },
+    DEVICE_BOUND_SECRET: { type: "secret string", secret: true, default: "derived signing secret", effect: "Independent HMAC secret for device credentials. Set explicitly in production for independent rotation." },
+    DEVICE_BOUND_TOKEN_TTL_SECONDS: { type: "number", secret: false, default: "2592000", range: "3600-31536000", effect: "Lifetime of the signed device credential. Default is 30 days." },
+    DEVICE_CREDENTIAL_COOKIE: { type: "fixed cookie name", secret: false, default: "__Host-VoriaDevice", effect: "Browser cookie name used by /device. HttpOnly, Secure, SameSite=Lax, Path=/, host-only." },
     TITLE: { type: "string", secret: false, default: "cfw-deezer-hifi-api", effect: "Browser document title for the root status page." },
     IMG: { type: "HTTP(S) URL", secret: false, default: "not set", effect: "Image URL displayed inside the expanded root img dictionary. The Worker proxies the configured image through a same-origin endpoint and validates its Content-Type." },
     IMG_TB: { type: "HTTP(S) URL", secret: false, default: "not set", effect: "Image URL used as the browser tab icon through a same-origin Worker proxy." },
@@ -3027,6 +4085,8 @@ function buildDocs(requestUrl, env) {
   };
 
   return {
+    diagnostics_disclaimer: "This diagnostic sweep checks configured Deezer ARLs and representative catalog/playback routes, including /routing and /docs. It may create upstream requests and media authorization work, but it intentionally does not download the full audio stream.",
+    diagnostics_default_track_id: "920991742",
     service: SERVICE_NAME,
     instance: getInstanceName(env),
     notes: getInstanceNotes(env),
@@ -3037,8 +4097,8 @@ function buildDocs(requestUrl, env) {
       purpose: "Deezer HiFi catalog, metadata, lyrics, recommendation, and playback gateway running as a Cloudflare Worker.",
       architecture: "Clients call this Worker. Catalog/auth/lyrics work uses Deezer APIs and authenticated Deezer sessions. Playback resolves a Deezer media URL, then /stream fetches the HTTPS Deezer CDN object and performs the required Blowfish block decryption while streaming the result to the client.",
       lossless_profile: "Deezer HiFi is represented as FLAC, 16-bit, 44.1 kHz, with bitrateUncompressed=1411 kbps.",
-      stream_security: "Authenticated generated stream URLs include the client api_key plus a short-lived HMAC-signed bootstrap stream_token whose first component is a fresh 256-bit SHA-256 nonce derived from cryptographically random bytes. The token has an explicit bootstrap type and is bound to the API-key identity, track id, and caller IP. Successful playback authorization consumes the short-lived bootstrap token and establishes a separate signed HttpOnly session cookie for chunked Range requests, so an expired URL token does not interrupt an already-authorized playback session. /stream does not act as an arbitrary URL proxy: upstream URLs must be HTTPS and match STREAM_CDN_HOSTS.",
-      performance: "Production responses default to compact JSON. Hot-path HMAC keys, API-key hashes, User-Agent hashes, track-token requests, and media-resolution requests use short-lived in-memory caches or in-flight coalescing to reduce repeated crypto/upstream work. Bootstrap tokens are never cached or coalesced because each emitted token must remain one-use and unique.",
+      stream_security: "Authenticated generated stream URLs include the client api_key plus a short-lived HMAC-signed bootstrap stream_token whose first component is a fresh 256-bit SHA-256 nonce derived from cryptographically random bytes. The token has an explicit bootstrap type and is bound to the API-key identity, track id, and caller IP. A valid token may be used again until expiration; there is no replay blacklist or one-use state. Successful playback authorization can establish a separate signed HttpOnly session cookie for chunked Range requests. /stream does not act as an arbitrary URL proxy: upstream URLs must be HTTPS and match STREAM_CDN_HOSTS.",
+      performance: "Production responses default to compact JSON. Hot-path HMAC keys, API-key hashes, User-Agent hashes, track-token requests, and media-resolution requests use short-lived in-memory caches or in-flight coalescing to reduce repeated crypto/upstream work. Bootstrap token generation remains uncached so each emitted URL gets a fresh nonce.",
       caching: "Shared catalog/search/lyrics caching is optional through GENERAL_MUSIC_CACHE. Playback media URLs remain upstream-expiring data and are not treated as long-lived shared cache objects by this API."
     },
     root_status: {
@@ -3063,9 +4123,9 @@ function buildDocs(requestUrl, env) {
       ],
       playback_pipeline: [
         "Metadata produces /stream-track URLs rather than exposing the raw Deezer CDN URL to the client.",
-        "Authenticated playback URLs carry api_key plus a unique one-use stream_token.",
+        "Authenticated playback URLs carry api_key plus a unique temporary stream_token.",
         "The bootstrap token is bound to track id, API-key identity, caller IP, and optionally User-Agent.",
-        "The token is atomically consumed when STREAM_TOKEN_GUARD is configured; otherwise the Worker uses same-isolate replay protection plus optional KV best-effort coordination.",
+        "The bootstrap token is signature-checked and client-bound, but is not stored as one-use state. The same valid token may be used again until it expires.",
         "Successful bootstrap authorization creates a signed HttpOnly __Host-VoriaStreamSession cookie.",
         "Subsequent Range requests use the playback session and can silently refresh it near expiry.",
         "The Worker resolves/refreshes Deezer media authorization, validates the CDN URL against STREAM_CDN_HOSTS, fetches bounded upstream ranges, decrypts the media blocks, and returns standard HTTP audio responses."
@@ -3075,7 +4135,7 @@ function buildDocs(requestUrl, env) {
         nonce: "32 cryptographically random bytes hashed with SHA-256 and rendered as 64 lowercase hexadecimal characters.",
         payload: "Contains token version/type, track id, API-key identity hash, caller IP, issue/expiry times, nonce, and optional User-Agent hash.",
         session: "A separate signed session credential stored in an HttpOnly __Host-VoriaStreamSession cookie; it is not placed in the stream URL.",
-        replay: "Bootstrap tokens are intentionally never coalesced or cached because every generated bootstrap credential must remain unique and one-use."
+        reuse: "Bootstrap tokens are not stored as one-use state. A valid signed token remains usable until its expiration time."
       },
       performance_architecture: {
         crypto_caches: ["Stream HMAC CryptoKey", "client API-key SHA-256 hashes", "client User-Agent SHA-256 hashes"],
@@ -3093,7 +4153,7 @@ function buildDocs(requestUrl, env) {
       },
       diagnostics: {
         "/ping": "Parallel ARL health/capability check with per-slot status.",
-        "/routing": "Live routing, authentication, playback-security, timeout, route, and hardening configuration summary.",
+        "/routing": "Public live routing, authentication, playback-security, timeout, route, and hardening configuration summary; no API key required.",
         "/env": "Admin-only non-secret environment diagnostics. Secret-like names/values are filtered and never exposed.",
         "/docs": "Public machine-readable documentation generated from the current Worker origin and environment configuration.",
         "/": "Credential-free instance identity/status response."
@@ -3107,7 +4167,7 @@ function buildDocs(requestUrl, env) {
         "This Worker source saved as worker.js, or deployed using the existing project entry point.",
         "At least one working Deezer ARL stored as a secret. Multiple ARLs are optional and enable account pooling/load balancing.",
         "If private client authentication is desired, at least one API_KEY slot should be configured.",
-        "For maximum stream-token replay resistance, optionally bind STREAM_TOKEN_GUARD to the exported StreamTokenGuard Durable Object class using a SQLite-backed Durable Object namespace."
+        "No replay-protection KV namespace is required. Keep the API private and use API keys for access control."
       ],
       minimal_local_files: {
         "worker.js": "The Worker source.",
@@ -3124,13 +4184,6 @@ function buildDocs(requestUrl, env) {
         "npx wrangler secret put ADMIN_API_KEY"
       ],
       important_secret_rule: "Use Cloudflare Secrets for ARLs, API keys, and admin credentials. Do not put those values in wrangler vars or commit .dev.vars/.env files.",
-      durable_object_guard: {
-        binding: "STREAM_TOKEN_GUARD",
-        class: "StreamTokenGuard",
-        purpose: "Strongly consistent one-use bootstrap-token replay prevention.",
-        recommended_backend: "SQLite-backed Durable Object",
-        note: "The Worker shards token hashes across 256 deterministic Durable Object IDs, so replay coordination is not forced through one global object."
-      }
     },
     quick_start: {
       private_api: [
@@ -3164,6 +4217,13 @@ function buildDocs(requestUrl, env) {
       playlist_tracks: `${origin}/playlist/123456/tracks`,
       chart_tracks: `${origin}/chart/tracks`,
       recommendations: `${origin}/recommendations?limit=25&offset=0`,
+      similar_recommendations: `${origin}/recommendations?id=3135556&limit=25`,
+      similar_recommendations_q: `${origin}/recommendations?q=Starboy%20The%20Weeknd&limit=25`,
+      similar_recommendations_isrc: `${origin}/recommendations?isrc=USUG11600920&limit=25`,
+      device: `${origin}/device`,
+      routing: `${origin}/routing`,
+      test_routings: `${origin}/testRoutings?api_key=<configured-api-key>&track_id=920991742`,
+      test_routing_alias: `${origin}/testRouting?api_key=<configured-api-key>&track_id=920991742`,
       lyrics: `${origin}/lyrics?id=3135556`,
       playable_track: `${origin}/stream-track/?id=3135556`,
       track_stream_redirect: `${origin}/track/3135556/stream?quality=flac`,
@@ -3176,27 +4236,29 @@ function buildDocs(requestUrl, env) {
       "/info": "Track metadata lookup by id or ISRC. Returns normalized track data with streamUrl.",
       "/search": "Search tracks, albums, artists, or playlists. Use type=track|album|artist|playlist, or the corresponding path /search/<type>. Track results include streamUrl.",
       "/track/:id": "Track metadata and playback resolution. /track/:id/stream returns a 302 to the Worker /stream URL; /track/:id/lyrics returns lyrics.",
-      "/stream-track/": "Resolve a numeric Deezer track id to a decrypted Worker stream response. Accepts id and optional quality/format.",
+      "/stream-track/": "Resolve a numeric Deezer track id to the Worker playback path. Accepts id and optional quality/format. Authenticated generated URLs use api_key plus stream_token, or api_key plus a short-lived ?device= token when DEVICE_BOUND_SIGNED_STREAMS=true; the long-lived d1 device credential is never embedded.",
       "/stream": "Decryption proxy for a resolved HTTPS Deezer CDN URL. Requires id, url, and format. Only hosts allowed by STREAM_CDN_HOSTS are accepted.",
       "/album/:id": "Album metadata plus normalized album tracks. Nested tracks include streamUrl.",
       "/album/:id/tracks": "Paginated album track listing. Tracks include streamUrl.",
       "/artist/:id": "Artist metadata.",
       "/artist/:id/top": "Paginated artist top-track listing. Tracks include streamUrl.",
       "/artist/:id/albums": "Paginated artist album listing.",
-      "/playlist/:id": "Playlist metadata plus normalized playlist tracks. Nested tracks include streamUrl.",
+      "/playlist/:id": "Playlist metadata plus normalized playlist tracks; /playlist can also generate a similar-track playlist from id/isrc/q/title/artist and includes the seed.",
       "/playlist/:id/tracks": "Paginated playlist track listing. Tracks include streamUrl.",
       "/playlist/:id/full": "Alias for playlist track listing.",
       "/chart/<tracks|albums|artists|playlists>": "Paginated Deezer chart data. Chart tracks include streamUrl.",
-      "/genre": "Paginated genre listing.",
-      "/genre/:id": "Genre metadata and its radio list when available.",
-      "/genre/:id/radios": "Supported by the underlying Deezer catalog route through the genre handler.",
-      "/radio/:id": "Radio metadata lookup.",
-      "/recommendations": "Personalized Deezer recommendations using the authenticated Deezer account behind the Worker. Supports limit, offset, and index. This API intentionally does not support id or user_id routing. Recommendation tracks include streamUrl.",
+      "/genre": "Paginated genre listing. /genre/:id resolves the real Deezer genre first and then loads its canonical genre chart; invalid genre IDs return a proper error instead of fabricated metadata.",
+      "/genre/:id": "Genre metadata plus non-empty chart collections (artists, albums, tracks) when Deezer returns them. Empty/null collections are omitted.",
+      "/radio": "Radio listing or generated track radio; use id/isrc/q/title/artist for track-based radio.",
+      "/radio/:id": "Radio metadata plus tracks; track-radio mode uses the same similarity engine as /recommendations.",
+      "/recommendations": "Personalized Deezer recommendations by default. For song-based recommendations, provide id, q/query/s, isrc/i, title, and/or artist to resolve a seed and return similar tracks. Examples: /recommendations?id=3135556, /recommendations?q=Starboy%20The%20Weeknd, /recommendations?isrc=USUG11600920. user_id is retained only for personalized mode and cannot be combined with song-based recommendations. Recommendation tracks include streamUrl.",
       "/lyrics": "Lyrics lookup for a track id. The Worker uses native Deezer lyrics sources and can return word-level data when Deezer provides it.",
-      "/cover": "Build normalized artwork URLs from a Deezer artwork hash or supported artwork URL. type=artist selects artist artwork handling.",
+      "/cover": "Build normalized artwork URLs from an artwork hash/URL, or resolve artwork from a track id, ISRC, query, or artist id.",
       "/ping": "Tests configured Deezer ARL slots and reports active/failed state and detected quality capability. Useful immediately after deployment.",
-      "/routing": "Authenticated routing, authentication, stream security, timeout, and hardening diagnostics.",
-      "/env": "Admin-only environment diagnostics. Values matching secret-like names are intentionally hidden. Requires ADMIN_API_KEY."
+      "/device": "Registers a cryptographically signed device credential when DEVICE_BOUND_SIGNED_STREAMS=true. Native clients should store device_token securely and send X-Voria-Device. Browsers can use the HttpOnly __Host-VoriaDevice cookie automatically set by /device. Refresh /device if the signing secret/credential is rotated or the browser no longer has a valid device cookie. If ALLOW_QUERY_DEVICE_SIGN=true, raw d1 credentials may be supplied as ?device_credential= for testing. Generated streamUrl values never contain the long-lived d1 credential.",
+      "/routing": "Public, rate-limited routing/security diagnostics. No API key is required because it reports configuration shape and limits, not credential values. It reports device-bound signing state, playback URL authorization, diagnostic aliases, and supported HTTP methods.",
+      "/env": "Admin-only environment diagnostics. Values matching secret-like names are intentionally hidden. Requires ADMIN_API_KEY directly; normal API_KEY is not required.",
+      "/testRoutings": "Protected end-to-end diagnostic sweep. Tests every permitted ARL for session/media capability, then exercises catalog, recommendation, artwork, lyrics, genre, routing, docs, and playback resolution paths. It never downloads the full audio stream. /testRouting is an accepted alias."
     },
     playback: {
       quality_parameter: "quality or format",
@@ -3237,7 +4299,7 @@ function buildDocs(requestUrl, env) {
     security: {
       secrets: "ARLs, client API keys, and ADMIN_API_KEY are credentials and should be stored as Cloudflare Secrets, not plaintext vars.",
       stream_proxy: "The /stream route is not an arbitrary fetch proxy. It requires HTTPS and an allowlisted Deezer CDN hostname.",
-      query_keys: "Query-string API keys are disabled by default because URLs can be logged or cached. Enable ALLOW_QUERY_API_KEY only when a client cannot send headers.",
+      query_keys: "Query-string API keys are disabled by default because URLs can be logged or cached. Enable ALLOW_QUERY_API_KEY only when a client cannot send headers. Generated playback URLs may still carry api_key for the authenticated stream flow; those responses are marked private/no-store and protected by short-lived playback authorization.",
       admin: "/env is protected separately with ADMIN_API_KEY even when PUBLIC_API=true.",
       cors: "CORS is controlled by CORS_ALLOW_ORIGIN and defaults to *."
     },
@@ -3247,8 +4309,9 @@ function buildDocs(requestUrl, env) {
       env_returns_403: "Supply ADMIN_API_KEY using Authorization: Bearer <ADMIN_API_KEY> or X-API-Key. /env never exposes secret values.",
       flac_falls_back: "The selected ARL may not have lossless capability, the Deezer media authorization may have expired, or the FLAC media URL request may have failed. /ping shows the detected account tier.",
       stream_rejected: "The /stream URL must use HTTPS and its hostname must match STREAM_CDN_HOSTS. The default allowlist is *.dzcdn.net and media.deezer.com.",
-      stream_api_key: "When a request is authenticated with an API key, generated streamUrl values and stream redirects carry that same key as api_key so the returned URL can be opened directly. A short-lived stream_token is also attached and bound to that key, the track, and the caller IP. After successful token validation, the Worker consumes the bootstrap token and sets an HttpOnly signed playback session cookie so subsequent Range requests do not depend on the URL token remaining unexpired. Playback routes accept these generated query parameters even when ALLOW_QUERY_API_KEY=false. Public API requests do not append client credentials.",
-      stream_token: "Generated authenticated stream URLs contain api_key for client/ARL identity plus stream_token for temporary bootstrap authorization. stream_token expires according to STREAM_TOKEN_TTL_SECONDS, is bound to the authenticated API key, track id, caller IP, and optionally the caller User-Agent when STREAM_TOKEN_BIND_USER_AGENT is enabled, and is consumed after successful authorization. The Worker then establishes an HttpOnly signed playback session cookie with an idle TTL controlled by STREAM_SESSION_TTL_SECONDS; active Range playback refreshes it near expiry. Copying only the URL to a different network/client normally causes a client-binding rejection, and replaying an already-consumed bootstrap token is rejected. The session cookie is never placed in the stream URL.",
+      stream_api_key: "When a request is authenticated with an API key, generated streamUrl values and stream redirects carry that same key as api_key so the returned URL can be opened directly. A short-lived stream_token is also attached and bound to that key, the track, and the caller IP. After successful token validation, the Worker can set an HttpOnly signed playback session cookie so subsequent Range requests do not depend on the URL token remaining unexpired. Playback routes accept these generated query parameters even when ALLOW_QUERY_API_KEY=false. Public API requests do not append client credentials.",
+      stream_token: "Generated authenticated stream URLs contain api_key for client/ARL identity plus stream_token for temporary bootstrap authorization. stream_token expires according to STREAM_TOKEN_TTL_SECONDS and is bound to the authenticated API key, track id, caller IP, and optionally the caller User-Agent when STREAM_TOKEN_BIND_USER_AGENT is enabled. The token is reusable until expiration because no replay blacklist is maintained. The Worker can establish an HttpOnly signed playback session cookie with an idle TTL controlled by STREAM_SESSION_TTL_SECONDS; active Range playback refreshes it near expiry. The session cookie is never placed in the stream URL.",
+      device_bound_streams: "When DEVICE_BOUND_SIGNED_STREAMS=true, call /device on the same host used for playback. Native clients should persist device_token securely and send X-Voria-Device; browsers can use the HttpOnly __Host-VoriaDevice cookie automatically set by /device. If the signing secret/credential is rotated or the browser no longer has the cookie, refresh /device. If ALLOW_QUERY_DEVICE_SIGN=true, raw credentials may be supplied as ?device_credential= for test clients. Generated streamUrl values include api_key and a short-lived device-bound playback token in ?device=, but never the long-lived d1 credential. A copied streamUrl therefore still fails without the original device credential. /stream-track, /track/:id/stream, and /stream validate both the device credential and the device-bound playback token.",
       stream_cache_security: "Catalog responses containing client API keys are marked private, no-store so one client's stream URL cannot be publicly cached and returned to another client.",
       slow_catalog: "Increase UPSTREAM_TIMEOUT_MS only when the upstream path genuinely needs more time. Shared catalog/search/lyrics caching can be enabled with GENERAL_MUSIC_CACHE.",
       slow_flac: "FLAC decryption is CPU-heavy. Keep STREAM_CHUNK_SIZE within the enforced range and avoid unnecessarily large concurrent playback workloads on small Worker plans.",
@@ -3258,7 +4321,7 @@ function buildDocs(requestUrl, env) {
       env_vars: "Cloudflare Worker vars are runtime bindings available through the env parameter. Sensitive values should be Secrets rather than plaintext vars.",
       local_secrets: "For local development, use .dev.vars or .env, not both. Do not commit either file when they contain secrets.",
       environments: "Wrangler environments are separate Worker configurations. Bindings such as vars, KV namespaces, and secrets must be configured for each environment rather than assumed to inherit.",
-      config_recommendation: "Use wrangler.jsonc as the project configuration source of truth for new Worker projects. Store STREAM_TOKEN_SECRET as a Worker Secret in production; if it is omitted, the Worker falls back to ADMIN_API_KEY or the primary Deezer ARL."
+      config_recommendation: "Use wrangler.jsonc as the project configuration source of truth for new Worker projects. Store STREAM_TOKEN_SECRET and DEVICE_BOUND_SECRET as Worker Secrets in production. Prefer a Custom Domain when this Worker is the origin for all paths; use a Workers Route when the Worker sits in front of an existing origin."
     }
   };
 }
@@ -3267,10 +4330,39 @@ function routingInfo(env) {
   return {
     service: SERVICE_NAME,
     version: API_VERSION,
-    authentication: String(env?.PUBLIC_API ?? "false").toLowerCase() === "true"
-      ? { mode: "public", public_api: true, api_key_required: false }
-      : { mode: String(env?.REQUIRE_API_KEY ?? "true").toLowerCase() !== "false" ? "required" : "optional", public_api: false, api_key_required: String(env?.REQUIRE_API_KEY ?? "true").toLowerCase() !== "false" },
-    stream_transport: "temporary client-bound Worker proxy URL with api_key client identity and one-use stream_token authorization; authenticated entry points require bootstrap authorization by default",
+    authentication: {
+      mode: String(env?.PUBLIC_API ?? "false").toLowerCase() === "true" ? "public" : (String(env?.REQUIRE_API_KEY ?? "true").toLowerCase() !== "false" ? "required" : "optional"),
+      public_api: String(env?.PUBLIC_API ?? "false").toLowerCase() === "true",
+      api_key_required: String(env?.PUBLIC_API ?? "false").toLowerCase() === "true" ? false : String(env?.REQUIRE_API_KEY ?? "true").toLowerCase() !== "false",
+      routing_public: true,
+      routing_api_key_required: false
+    },
+    public_diagnostics: {
+      docs: true,
+      routing: true,
+      testRouting_aliases: ["/testRoutings", "/testRouting"],
+      env: false,
+      testRouting_authentication: "client API key unless PUBLIC_API=true with no configured API_KEY mappings"
+    },
+    recommendation_inputs: {
+      supported_seed_parameters: ["id", "q", "query", "s", "isrc", "i", "title", "track", "song", "artist"],
+      route: "/recommendations",
+      track_radio_route: "/radio?mode=track with the same seed parameters"
+    },
+    stream_transport: deviceBoundStreamsEnabled(env)
+      ? "temporary client-bound Worker proxy URL with api_key client identity and short-lived device-bound playback token in ?device=; the long-lived d1 device credential stays in X-Voria-Device or the __Host-VoriaDevice cookie"
+      : "temporary client-bound Worker proxy URL with api_key client identity and temporary stream_token authorization; authenticated entry points require bootstrap authorization by default",
+    device_bound_streams: {
+      enabled: deviceBoundStreamsEnabled(env),
+      credential_header: "X-Voria-Device",
+      browser_cookie: DEVICE_CREDENTIAL_COOKIE,
+      query_credential_enabled: allowQueryDeviceSign(env),
+      query_credential_parameter: "device_credential",
+      generated_url_parameter: "device",
+      generated_url_token: "short-lived HMAC playback token bound to the device credential hash, track, API key, caller IP, and optional User-Agent",
+      long_lived_credential_in_url: false,
+      refresh_note: "Browsers must obtain/refresh /device on the same host so the __Host- cookie is present. Native clients should persist device_token and send X-Voria-Device."
+    },
     media_resolution: {
       reauthentication_retries: getMediaRetryCount(env),
       timeout_ms: getMediaTimeoutMs(env),
@@ -3280,11 +4372,20 @@ function routingInfo(env) {
       quality_ladder: "FLAC -> MP3_320 -> MP3_128"
     },
     routes: {
-      GET: ["/", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/recommendations", "/cover", "/lyrics", "/stream-track", "/stream", "/track/:id/stream", "/track/:id/lyrics", "/ping", "/routing", "/env", "/docs"],
+      GET: ["/", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/recommendations", "/cover", "/lyrics", "/stream-track", "/stream", "/track/:id/stream", "/track/:id/lyrics", "/ping", "/device", "/routing", "/env", "/docs", "/testRoutings", "/testRouting"],
       OPTIONS: ["/*"],
-      HEAD: ["/stream", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/cover", "/ping", "/routing", "/env", "/docs"]
+      HEAD: ["/stream", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/cover", "/ping", "/device", "/routing", "/env", "/docs", "/testRoutings", "/testRouting"]
     },
-    stream_security: { arbitrary_url_proxy: false, requires_signed_token: true, requires_https_cdn: true, stream_url_format: "/stream-track/?id=<trackId>&api_key=<client-key>&stream_token=<short-lived-token> (metadata/playback URLs); /stream remains an internal Worker proxy format", allowed_hosts: String(env?.STREAM_CDN_HOSTS || "*.dzcdn.net;media.deezer.com").split(";").map(x => x.trim()).filter(Boolean) },
+    stream_security: {
+      arbitrary_url_proxy: false,
+      requires_signed_token: true,
+      requires_https_cdn: true,
+      device_bound: deviceBoundStreamsEnabled(env),
+      stream_url_format: deviceBoundStreamsEnabled(env)
+        ? "/stream-track/?id=<trackId>&api_key=<client-key>&device=<short-lived-device-bound-token> (generated authenticated URLs; long-lived d1 credential is never embedded)"
+        : "/stream-track/?id=<trackId>&api_key=<client-key>&stream_token=<short-lived-token> (generated authenticated URLs)",
+      internal_proxy_route: "/stream",
+      allowed_hosts: String(env?.STREAM_CDN_HOSTS || "*.dzcdn.net;media.deezer.com").split(";").map(x => x.trim()).filter(Boolean) },
     hardening: { allowed_methods: ["GET", "HEAD", "OPTIONS"], max_url_length: MAX_REQUEST_URL_LENGTH, max_query_value_length: MAX_QUERY_VALUE_LENGTH, upstream_timeout_ms: getUpstreamTimeoutMs(env), max_catalog_response_bytes: MAX_UPSTREAM_RESPONSE_BYTES }
   };
 }
@@ -3294,6 +4395,7 @@ function routingInfo(env) {
 
 const worker = {
   async fetch(request, env) {
+    try {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: getCorsHeaders(env) });
     }
@@ -3311,6 +4413,20 @@ const worker = {
     const segments = routePath.split("/").filter(Boolean);
     const primaryRoute = segments[0] || "";
 
+    if (isTestRoutingsPath(requestUrl)) {
+      const testAuth = authenticateTestRoutings(requestUrl, env);
+      if (!testAuth.authorized) return publicError("FORBIDDEN", 403, env, requestId);
+      const testKey = getTestRoutingPresentedKey(requestUrl);
+      const diagnosticTrackId = requestUrl.searchParams.get("track_id")?.trim() || "920991742";
+      if (request.method === "HEAD") {
+        return new Response(null, { status: 200, headers: { ...getCorsHeaders(env), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Request-ID": requestId } });
+      }
+      // /testRoutings is intentionally a machine-readable diagnostics endpoint.
+      // It performs the complete ARL + route sweep and returns one normal JSON document.
+      const diagnostics = await runTestRoutingsJson(request, env, requestUrl, diagnosticTrackId, testKey, testAuth.allowedSlots);
+      return jsonResponse(diagnostics, diagnostics.status === "complete" ? 200 : 502, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
+    }
+
     if (primaryRoute === "docs") {
       const response = jsonResponse(buildDocs(requestUrl, env), 200, { "Cache-Control": "public, max-age=300", "X-Request-ID": requestId }, env);
       return request.method === "HEAD" ? new Response(null, { status: response.status, headers: response.headers }) : response;
@@ -3327,14 +4443,23 @@ const worker = {
       return request.method === "HEAD" ? new Response(null, { status: 200, headers }) : new Response(html, { status: 200, headers });
     }
 
-    if (request.method === "HEAD" && !["stream", "info", "search", "track", "album", "artist", "playlist", "chart", "genre", "radio", "cover", "ping", "routing", "env", "docs"].includes((requestUrl.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || ""))) {
+    if (request.method === "HEAD" && !["stream", "info", "search", "track", "album", "artist", "playlist", "chart", "genre", "radio", "cover", "ping", "device", "routing", "env", "docs", "testRoutings", "testRouting"].includes((requestUrl.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || ""))) {
       return new Response(null, { status: 404, headers: { ...getCorsHeaders(env), "X-Request-ID": requestId } });
     }
 
 
     const clientIp = getClientIp(request);
     const clientUserAgentHash = await getClientUserAgent(request);
-    const auth = authenticateRequest(request, env);
+
+    // /routing is intentionally public. It reports route/authentication metadata
+    // only and does not expose credentials, ARLs, tokens, or other secret values.
+    // Keep rate limiting in place so making this endpoint credential-free does not
+    // make it an unlimited request target.
+    const isPublicRouting = primaryRoute === "routing";
+    const isAdminEnv = primaryRoute === "env";
+    const auth = (isPublicRouting || isAdminEnv)
+      ? { authorized: true, allowedSlots: null, tokenId: isPublicRouting ? "public-routing" : "admin-env" }
+      : authenticateRequest(request, env);
     if (!auth.authorized) {
       return publicError("UNAUTHORIZED", 401, env, requestId);
     }
@@ -3348,6 +4473,21 @@ const worker = {
     }
     const authToken = auth.tokenId && auth.tokenId !== "public" ? auth.tokenId : null;
     const preferExplicit = isExplicitPreferred(requestUrl, env);
+    const deviceBinding = await getRequestDeviceBinding(request, authToken, env);
+    const deviceBindingHash = deviceBoundStreamsEnabled(env) ? deviceBinding.hash : null;
+    const deviceCredential = deviceBinding.valid ? getPresentedDeviceCredential(request, env) : null;
+    const catalogResponseForRequest = (...args) => catalogResponse(...args, deviceCredential);
+
+    if (primaryRoute === "device") {
+      if (!deviceBoundStreamsEnabled(env)) return jsonResponse({ version: API_VERSION, enabled: false, message: "DEVICE_BOUND_SIGNED_STREAMS is disabled" }, 200, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
+      if (request.method !== "GET") return publicError("METHOD_NOT_ALLOWED", 405, env, requestId);
+      const credential = await registerDeviceCredential(authToken, env);
+      if (!credential) return publicError("DEVICE_SIGNING_NOT_CONFIGURED", 503, env, requestId);
+      const deviceCheck = await verifyDeviceCredential(credential, authToken, env);
+      const ttl = Math.max(1, Number(deviceCheck.payload?.exp || 0) - Math.floor(Date.now() / 1000));
+      const deviceCookie = `${DEVICE_CREDENTIAL_COOKIE}=${encodeURIComponent(credential)}; Path=/; Max-Age=${ttl}; HttpOnly; Secure; SameSite=Lax`;
+      return jsonResponse({ version: API_VERSION, enabled: true, device_token: credential, device_id: deviceCheck.id, expires_at: deviceCheck.payload?.exp || null, header: "X-Voria-Device", cookie: DEVICE_CREDENTIAL_COOKIE, usage: "Store the device_token securely for native clients, or rely on the HttpOnly device cookie set by this response. Generated streamUrl values never contain the long-lived d1 device credential." }, 200, { "Cache-Control": "no-store", "X-Request-ID": requestId, "Set-Cookie": deviceCookie }, env);
+    }
 
     if (isMaintenanceMode(env) && primaryRoute !== "env") {
       return jsonResponse({
@@ -3365,7 +4505,8 @@ const worker = {
     }
     if (primaryRoute === "env") {
       const presented = getPresentedApiToken(request, env);
-      if (!env?.ADMIN_API_KEY || !presented || presented !== String(env.ADMIN_API_KEY).trim()) return publicError("FORBIDDEN", 403, env, requestId);
+      const configuredAdmin = String(env?.ADMIN_API_KEY || "").trim();
+      if (!configuredAdmin || !presented || presented !== configuredAdmin) return publicError("FORBIDDEN", 403, env, requestId);
       const response = jsonResponse({ service: SERVICE_NAME, version: API_VERSION, variables: diagnosticEnv(env), variableDocumentation: ENVIRONMENT_VARIABLES, streamTokenSecurity: STREAM_TOKEN_SECURITY_NOTE, secret_variables: ["DEEZER_ARL[_1..50]", "API_KEY[_1..50]", "ADMIN_API_KEY", "STREAM_TOKEN_SECRET"] }, 200, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
       return request.method === "HEAD" ? new Response(null, { status: response.status, headers: response.headers }) : response;
     }
@@ -3412,15 +4553,18 @@ const worker = {
     if (primaryRoute === "stream") {
       const trackId = segments[1] || requestUrl.searchParams.get("id");
       const legacyCdnUrl = requestUrl.searchParams.get("url");
-      const streamToken = requestUrl.searchParams.get("stream_token");
+      const streamToken = requestUrl.searchParams.get("stream_token") || (String(requestUrl.searchParams.get("device") || "").startsWith("d1.") ? null : requestUrl.searchParams.get("device"));
 
+      if (deviceBoundStreamsEnabled(env) && !deviceBinding.valid) return publicError(deviceBinding.present ? "DEVICE_CREDENTIAL_INVALID" : "DEVICE_CREDENTIAL_REQUIRED", 401, env, requestId);
       let streamSessionValid = false;
       let streamSessionEstablishedByCookie = false;
       let streamSessionCheck = null;
       if (authToken && trackId) {
         const sessionCookie = getCookie(request, STREAM_SESSION_COOKIE);
         if (sessionCookie) {
-          const sessionCheck = await verifyStreamSession(decodeURIComponent(sessionCookie), { trackId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null }, env);
+          let decodedSessionCookie = sessionCookie;
+          try { decodedSessionCookie = decodeURIComponent(sessionCookie); } catch (_) { decodedSessionCookie = sessionCookie; }
+          const sessionCheck = await verifyStreamSession(decodedSessionCookie, { trackId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null, deviceBindingHash }, env);
           streamSessionCheck = sessionCheck;
           streamSessionValid = sessionCheck.valid;
           streamSessionEstablishedByCookie = sessionCheck.valid;
@@ -3430,15 +4574,16 @@ const worker = {
       let streamTokenAuthorized = false;
       if (streamToken && !streamSessionValid) {
         if (!authToken || !trackId) return publicError("INVALID_STREAM_TOKEN", 401, env, requestId);
-        const tokenCheck = await verifyStreamBootstrapToken(streamToken, { trackId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null }, env);
-        if (!tokenCheck.valid) return publicError("INVALID_STREAM_TOKEN", tokenCheck.reason === "expired" ? 401 : 403, env, requestId);
-        const consumed = await consumeStreamBootstrapToken(streamToken, env);
-        if (!consumed.allowed) return publicError("STREAM_TOKEN_REPLAYED", 403, env, requestId);
+        const tokenCheck = await verifyStreamBootstrapToken(streamToken, { trackId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null, deviceBindingHash }, env);
+        if (!tokenCheck.valid) return invalidStreamBootstrapToken(tokenCheck.reason, tokenCheck.reason === "expired" ? 401 : 403, env, requestId);
         streamTokenAuthorized = true;
         streamSessionValid = true;
       }
 
-      if (authenticatedPlaybackRequiresBootstrap(env, authToken) && !streamSessionValid && !streamTokenAuthorized) {
+      // A valid device-bound credential is itself sufficient playback authorization.
+      // This allows device-bound stream URLs to be replayable by the registered device
+      // without requiring a separate bootstrap/session token on every generated URL.
+      if (authenticatedPlaybackRequiresBootstrap(env, authToken) && !deviceBinding.valid && !streamSessionValid && !streamTokenAuthorized) {
         return publicError("PLAYBACK_SESSION_REQUIRED", 401, env, requestId);
       }
 
@@ -3446,11 +4591,13 @@ const worker = {
         const q = requestUrl.searchParams.get("quality") || env?.DEFAULT_QUALITY || "best";
         const alt = requestUrl.searchParams.get("alt") ? `&alt=${encodeURIComponent(requestUrl.searchParams.get("alt"))}` : "";
         const exp = !preferExplicit ? "&explicit=false" : "";
-        let streamTrackUrl = appendApiKeyToStreamUrl(
+        let streamTrackUrl = appendAuthenticatedStreamCredentials(
           `${requestUrl.origin}/stream-track?id=${encodeURIComponent(trackId)}&quality=${encodeURIComponent(q)}${alt}${exp}`,
           authToken,
+          deviceCredential,
+          env,
         );
-        streamTrackUrl = await appendStreamTokenToUrl(streamTrackUrl, authToken, clientIp, env, clientUserAgentHash);
+        streamTrackUrl = await appendStreamTokenToUrl(streamTrackUrl, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash);
         return Response.redirect(streamTrackUrl, 302);
       }
 
@@ -3473,8 +4620,8 @@ const worker = {
         const headers = new Headers(getCorsHeaders(env));
         if (authToken && trackId) {
           const cookie = streamTokenAuthorized
-            ? await establishStreamSession(trackId, authToken, clientIp, env, clientUserAgentHash)
-            : await maybeRefreshStreamSession(streamSessionCheck, trackId, authToken, clientIp, env, clientUserAgentHash);
+            ? await establishStreamSession(trackId, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash)
+            : await maybeRefreshStreamSession(streamSessionCheck, trackId, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash);
           if (cookie) headers.append("Set-Cookie", cookie);
         }
         headers.set("Content-Type", mimeType);
@@ -3559,8 +4706,8 @@ const worker = {
         const headers = new Headers(getCorsHeaders(env));
         if (authToken && trackId) {
           const cookie = streamTokenAuthorized
-            ? await establishStreamSession(trackId, authToken, clientIp, env, clientUserAgentHash)
-            : await maybeRefreshStreamSession(streamSessionCheck, trackId, authToken, clientIp, env, clientUserAgentHash);
+            ? await establishStreamSession(trackId, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash)
+            : await maybeRefreshStreamSession(streamSessionCheck, trackId, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash);
           if (cookie) headers.append("Set-Cookie", cookie);
         }
         headers.set("Content-Type", mimeType);
@@ -3585,19 +4732,21 @@ const worker = {
 
 
     if (primaryRoute === "stream-track") {
+      if (deviceBoundStreamsEnabled(env) && !deviceBinding.valid) return publicError(deviceBinding.present ? "DEVICE_CREDENTIAL_INVALID" : "DEVICE_CREDENTIAL_REQUIRED", 401, env, requestId);
       const rawId = segments[1] || requestUrl.searchParams.get("id") || requestUrl.searchParams.get("track_id");
-      const streamToken = requestUrl.searchParams.get("stream_token");
+      const streamToken = requestUrl.searchParams.get("stream_token") || (String(requestUrl.searchParams.get("device") || "").startsWith("d1.") ? null : requestUrl.searchParams.get("device"));
       let streamSessionCookieValue = null;
-      if (authenticatedPlaybackRequiresBootstrap(env, authToken) && !streamToken) {
+      // Device-bound credentials can authorize playback directly.
+      // Bootstrap tokens remain required for authenticated clients that do not
+      // present a valid device credential.
+      if (authenticatedPlaybackRequiresBootstrap(env, authToken) && !deviceBinding.valid && !streamToken) {
         return publicError("STREAM_TOKEN_REQUIRED", 401, env, requestId);
       }
       if (streamToken) {
         if (!authToken || !rawId) return publicError("INVALID_STREAM_TOKEN", 401, env, requestId);
-        const tokenCheck = await verifyStreamBootstrapToken(streamToken, { trackId: rawId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null }, env);
-        if (!tokenCheck.valid) return publicError("INVALID_STREAM_TOKEN", tokenCheck.reason === "expired" ? 401 : 403, env, requestId);
-        const consumed = await consumeStreamBootstrapToken(streamToken, env);
-        if (!consumed.allowed) return publicError("STREAM_TOKEN_REPLAYED", 403, env, requestId);
-        streamSessionCookieValue = await establishStreamSession(rawId, authToken, clientIp, env, clientUserAgentHash);
+        const tokenCheck = await verifyStreamBootstrapToken(streamToken, { trackId: rawId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null, deviceBindingHash }, env);
+        if (!tokenCheck.valid) return invalidStreamBootstrapToken(tokenCheck.reason, tokenCheck.reason === "expired" ? 401 : 403, env, requestId);
+        streamSessionCookieValue = await establishStreamSession(rawId, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash);
       }
       const paramIsrc = requestUrl.searchParams.get("isrc") || requestUrl.searchParams.get("i");
       const paramTitle = requestUrl.searchParams.get("title") || requestUrl.searchParams.get("track") || requestUrl.searchParams.get("song");
@@ -3621,18 +4770,20 @@ const worker = {
 
         const resolved = await resolvePlaybackStreamOnly(songId, rawQuality, env, auth.allowedSlots);
         const resolvedTrackId = resolved.trackId || songId;
-        let cleanStreamUrl = appendApiKeyToStreamUrl(
+        let cleanStreamUrl = appendAuthenticatedStreamCredentials(
           `${requestUrl.origin}/stream?id=${resolvedTrackId}&url=${encodeURIComponent(resolved.mediaResult.directCdnUrl)}&format=${encodeURIComponent(resolved.mediaResult.format)}`,
           authToken,
+          deviceCredential,
+          env,
         );
         if (streamSessionCookieValue) {
-          // The bootstrap token is one-use. Do not carry it into the next redirect.
+          // The bootstrap token is temporary. Do not carry it into the next redirect.
           try { new URL(cleanStreamUrl).searchParams.delete("stream_token"); } catch (_) {}
           const stripped = new URL(cleanStreamUrl);
           stripped.searchParams.delete("stream_token");
           cleanStreamUrl = stripped.toString();
         } else {
-          cleanStreamUrl = await appendStreamTokenToUrl(cleanStreamUrl, authToken, clientIp, env, clientUserAgentHash);
+          cleanStreamUrl = await appendStreamTokenToUrl(cleanStreamUrl, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash);
         }
         const headers = { Location: cleanStreamUrl, "Cache-Control": "no-store", "X-Request-ID": requestId };
         if (streamSessionCookieValue) headers["Set-Cookie"] = streamSessionCookieValue;
@@ -3646,12 +4797,21 @@ const worker = {
     const catalogRoutes = ["info-api", "info", "search", "album", "artist", "playlist", "cover", "chart", "genre", "radio", "recommendations"];
     if (catalogRoutes.includes(primaryRoute)) {
       try {
-        const catalogResult = await handleCatalogRoute(requestUrl, env, segments, authToken, clientIp, clientUserAgentHash);
+        const catalogResult = await handleCatalogRoute(requestUrl, env, segments, authToken, clientIp, clientUserAgentHash, deviceCredential);
         if (catalogResult) {
           if (request.method === "HEAD") return new Response(null, { status: catalogResult.status, headers: catalogResult.headers });
           return catalogResult;
         }
       } catch (error) {
+        if (primaryRoute === "recommendations" || requestUrl.pathname.startsWith("/recommendations")) {
+          return jsonResponse({
+            error: "CATALOG_REQUEST_FAILED",
+            status: error?.status >= 400 ? error.status : 502,
+            code: error?.code || "CATALOG_UPSTREAM_ERROR",
+            message: error?.message || "Catalog request failed",
+            request_id: requestId,
+          }, error?.status >= 400 ? error.status : 502, { "X-Request-ID": requestId, "Cache-Control": "no-store" }, env);
+        }
         return publicError("CATALOG_REQUEST_FAILED", error?.status >= 400 ? error.status : 502, env, requestId);
       }
     }
@@ -3672,16 +4832,15 @@ const worker = {
 
 
     if (primaryRoute === "track" && segments[1] && /^\d+$/.test(segments[1]) && segments[2] === "stream") {
+      if (deviceBoundStreamsEnabled(env) && !deviceBinding.valid) return publicError(deviceBinding.present ? "DEVICE_CREDENTIAL_INVALID" : "DEVICE_CREDENTIAL_REQUIRED", 401, env, requestId);
       const requestedTrackId = segments[1];
-      const streamToken = requestUrl.searchParams.get("stream_token");
+      const streamToken = requestUrl.searchParams.get("stream_token") || (String(requestUrl.searchParams.get("device") || "").startsWith("d1.") ? null : requestUrl.searchParams.get("device"));
       if (authenticatedPlaybackRequiresBootstrap(env, authToken) && !streamToken) {
         return publicError("STREAM_TOKEN_REQUIRED", 401, env, requestId);
       }
       if (streamToken) {
-        const tokenCheck = await verifyStreamBootstrapToken(streamToken, { trackId: requestedTrackId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null }, env);
-        if (!tokenCheck.valid) return publicError("INVALID_STREAM_TOKEN", tokenCheck.reason === "expired" ? 401 : 403, env, requestId);
-        const consumed = await consumeStreamBootstrapToken(streamToken, env);
-        if (!consumed.allowed) return publicError("STREAM_TOKEN_REPLAYED", 403, env, requestId);
+        const tokenCheck = await verifyStreamBootstrapToken(streamToken, { trackId: requestedTrackId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null, deviceBindingHash }, env);
+        if (!tokenCheck.valid) return invalidStreamBootstrapToken(tokenCheck.reason, tokenCheck.reason === "expired" ? 401 : 403, env, requestId);
       }
       const rawQuality = (requestUrl.searchParams.get("quality") || requestUrl.searchParams.get("format") || env?.DEFAULT_QUALITY || "best").toLowerCase().trim();
       try {
@@ -3690,13 +4849,15 @@ const worker = {
         if (String(resolvedTrackId) !== String(requestedTrackId)) {
           return publicError("STREAM_TRACK_MISMATCH", 403, env, requestId);
         }
-        let streamUrl = appendApiKeyToStreamUrl(
+        let streamUrl = appendAuthenticatedStreamCredentials(
           `${requestUrl.origin}/stream?id=${resolvedTrackId}&url=${encodeURIComponent(resolved.mediaResult.directCdnUrl)}&format=${encodeURIComponent(resolved.mediaResult.format)}`,
           authToken,
+          deviceCredential,
+          env,
         );
         let sessionCookie = null;
         if (authToken) {
-          sessionCookie = await establishStreamSession(resolvedTrackId, authToken, clientIp, env, clientUserAgentHash);
+          sessionCookie = await establishStreamSession(resolvedTrackId, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash);
         }
         if (sessionCookie) {
           const stripped = new URL(streamUrl);
@@ -3720,7 +4881,7 @@ const worker = {
         const session = pickAuxiliarySession(pools, env) || pools.lossless[0]?.session || pools.lossy[0]?.session;
         const lyrics = await getDeezerLyrics(session, segments[1], env);
         if (!lyrics) return apiErrorResponse("Lyrics not found", 404, null, env);
-        return catalogResponse({ version: API_VERSION, track_id: segments[1], data: lyrics }, 200, 60, env, apiToken, clientIp, clientUserAgentHash);
+        return catalogResponseForRequest({ version: API_VERSION, track_id: segments[1], data: lyrics }, 200, 60, env, apiToken, clientIp, clientUserAgentHash);
       } catch (error) {
         return publicError("LYRICS_REQUEST_FAILED", 502, env, requestId);
       }
@@ -3751,11 +4912,13 @@ const worker = {
       if (requestUrl.searchParams.get("stream") === "1" && !requestUrl.searchParams.has("json")) {
         const resolved = await resolvePlaybackStreamOnly(songId, rawQuality, env, auth.allowedSlots);
         const resolvedTrackId = resolved.trackId || songId;
-        let cleanStreamUrl = appendApiKeyToStreamUrl(
+        let cleanStreamUrl = appendAuthenticatedStreamCredentials(
           `${requestUrl.origin}/stream?id=${resolvedTrackId}&url=${encodeURIComponent(resolved.mediaResult.directCdnUrl)}&format=${encodeURIComponent(resolved.mediaResult.format)}`,
           authToken,
+          deviceCredential,
+          env,
         );
-        cleanStreamUrl = await appendStreamTokenToUrl(cleanStreamUrl, authToken, clientIp, env, clientUserAgentHash);
+        cleanStreamUrl = await appendStreamTokenToUrl(cleanStreamUrl, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash);
         return new Response(null, { status: 302, headers: { Location: cleanStreamUrl, "Cache-Control": "no-store", "X-Request-ID": requestId } });
       }
 
@@ -3779,9 +4942,11 @@ const worker = {
       const trackData = resolved.trackData;
       const resolvedTrackId = resolved.trackId || songId;
 
-      const cleanStreamUrl = appendApiKeyToStreamUrl(
+      const cleanStreamUrl = appendAuthenticatedStreamCredentials(
         `${requestUrl.origin}/stream?id=${resolvedTrackId}&url=${encodeURIComponent(mediaResult.directCdnUrl)}&format=${encodeURIComponent(mediaResult.format)}`,
         authToken,
+        deviceCredential,
+        env,
       );
       const albumArtwork = buildArtworkUrls(trackData.ALB_PICTURE || track?.album?.cover_xl || track?.album?.cover, "cover");
       const artistArtwork = buildArtworkUrls(trackData.ART_PICTURE || track?.artist?.picture_xl || track?.artist?.picture, "artist");
@@ -3847,7 +5012,7 @@ const worker = {
           can320: Boolean(resolved.session?.can320 ?? resolved.session?.canLossless),
         },
         sourceMetadata: sanitizeSourceMetadata(trackData),
-        streamUrl: await appendStreamTokenToUrl(cleanStreamUrl, authToken, clientIp, env, clientUserAgentHash),
+        streamUrl: await appendStreamTokenToUrl(cleanStreamUrl, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash),
       };
 
       if (wantLyrics) responsePayload.lyrics = lyricsResult;
@@ -3873,41 +5038,19 @@ const worker = {
         diagnostic,
       }, 502, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
     }
+    } catch (error) {
+      const requestId = request.headers.get("X-Request-ID")?.trim().slice(0, 128) || makeRequestId();
+      return jsonResponse({
+        error: "STREAM_REQUEST_FAILED",
+        status: 500,
+        request_id: requestId,
+        diagnostic: {
+          code: error?.code || null,
+          message: String(error?.message || error || "Unknown Worker error").slice(0, 500),
+        },
+      }, 500, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
+    }
   },
 };
-
-export class StreamTokenGuard extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-    if (url.pathname !== "/consume" || request.method !== "POST") {
-      return new Response("Not Found", { status: 404 });
-    }
-
-    try {
-      const body = await request.json();
-      const hash = String(body?.hash || "").toLowerCase();
-      const ttl = Math.min(7200, Math.max(60, Number.parseInt(body?.ttl, 10) || 60));
-      if (!/^[a-f0-9]{64}$/.test(hash)) {
-        return Response.json({ allowed: false, reason: "invalid_hash" }, { status: 400 });
-      }
-
-      const allowed = await this.ctx.storage.transaction(async (txn) => {
-        const key = `used:${hash}`;
-        const existing = await txn.get(key);
-        if (existing) return false;
-        await txn.put(key, "1", { expirationTtl: ttl });
-        return true;
-      });
-
-      return Response.json({ allowed });
-    } catch (_) {
-      return Response.json({ allowed: false, reason: "guard_error" }, { status: 500 });
-    }
-  }
-}
 
 export default worker;
