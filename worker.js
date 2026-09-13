@@ -12,7 +12,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.4.23";
+const API_VERSION = "1.4.24";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -1619,12 +1619,18 @@ async function getLyricsFromPipeGQL(arl, trackId, env = null) {
     }
 
     const lyricsObj = result.json?.data?.track?.lyrics;
-    if (!lyricsObj || (!lyricsObj.text && !lyricsObj.synchronizedLines?.length && !lyricsObj.synchronizedWordByWordLines?.length)) {
-      return null;
-    }
+    if (!lyricsObj) return null;
 
     const wordSync = normalizeWordSync(lyricsObj.synchronizedWordByWordLines);
     const lineSync = normalizeLyricsLines(lyricsObj.synchronizedLines);
+    const hasWordSync = Array.isArray(wordSync) && wordSync.length > 0;
+    const hasLineSync = Array.isArray(lineSync) && lineSync.length > 0;
+    const hasPlain = typeof lyricsObj.text === "string" && lyricsObj.text.trim().length > 0;
+
+    // Deezer can legitimately return line-synchronized lyrics with no word
+    // synchronization and sometimes no plain text. That is still a valid
+    // lyrics result and must not be treated as "no lyrics".
+    if (!hasWordSync && !hasLineSync && !hasPlain) return null;
     let lrc = null;
 
     if (wordSync?.length) {
@@ -1636,9 +1642,9 @@ async function getLyricsFromPipeGQL(arl, trackId, env = null) {
     return {
       source: "deezer_graphql",
       id: lyricsObj.id ?? null,
-      syncType: wordSync?.length ? "WORD_BY_WORD" : (lineSync?.length ? "LINE_BY_LINE" : "UNSYNCED"),
-      hasWordSync: Boolean(wordSync?.length),
-      hasLineSync: Boolean(lineSync?.length),
+      syncType: hasWordSync ? "WORD_BY_WORD" : (hasLineSync ? "LINE_BY_LINE" : "UNSYNCED"),
+      hasWordSync,
+      hasLineSync,
       writers: lyricsObj.writers ?? null,
       copyright: lyricsObj.copyright ?? lyricsObj.licence ?? null,
       plain: lyricsObj.text ?? null,
@@ -1709,22 +1715,46 @@ async function getLyricsFromGwLight(session, trackId, env = null) {
 }
 
 
+function hasUsableDeezerLyrics(value) {
+  if (!value) return false;
+  if (value.hasWordSync && Array.isArray(value.synchronizedWordByWordLines) && value.synchronizedWordByWordLines.length > 0) return true;
+  if (value.hasLineSync && Array.isArray(value.synchronizedLines) && value.synchronizedLines.length > 0) return true;
+  if (typeof value.plain === "string" && value.plain.trim().length > 0) return true;
+  if (typeof value.lrc === "string" && value.lrc.trim().length > 0) return true;
+  return false;
+}
+
 async function mergeDeezerLyricsResults(results) {
-  const usable = results.filter(Boolean);
+  const usable = results.filter(hasUsableDeezerLyrics);
   if (!usable.length) return null;
 
-  // Prefer the richest synchronized representation, but merge fields from
-  // both private Deezer backends. Pipe can expose word-by-word timing while
-  // gw-light can expose the plain/synchronized lyric payload.
-  const word = usable.find(x => x.hasWordSync && Array.isArray(x.synchronizedWordByWordLines) && x.synchronizedWordByWordLines.length);
-  const line = usable.find(x => x.hasLineSync && Array.isArray(x.synchronizedLines) && x.synchronizedLines.length);
-  const plain = usable.find(x => x.plain);
+  // Lyrics quality is hierarchical, but every usable tier is valid:
+  // WORD_BY_WORD > LINE_BY_LINE > UNSYNCED.
+  // Line-only lyrics must never collapse to null just because word timing
+  // is unavailable.
+  const word = usable.find(x =>
+    x.hasWordSync &&
+    Array.isArray(x.synchronizedWordByWordLines) &&
+    x.synchronizedWordByWordLines.length > 0
+  );
+  const line = usable.find(x =>
+    x.hasLineSync &&
+    Array.isArray(x.synchronizedLines) &&
+    x.synchronizedLines.length > 0
+  );
+  const plain = usable.find(x => typeof x.plain === "string" && x.plain.trim().length > 0);
   const base = word || line || plain || usable[0];
 
   const hasWordSync = Boolean(word);
   const hasLineSync = Boolean(line || base?.hasLineSync);
-  const synchronizedWordByWordLines = word?.synchronizedWordByWordLines || base?.synchronizedWordByWordLines || null;
-  const synchronizedLines = line?.synchronizedLines || base?.synchronizedLines || null;
+  const synchronizedWordByWordLines =
+    word?.synchronizedWordByWordLines ||
+    base?.synchronizedWordByWordLines ||
+    null;
+  const synchronizedLines =
+    line?.synchronizedLines ||
+    base?.synchronizedLines ||
+    null;
 
   let lrc = null;
   if (hasWordSync && word?.lrc) lrc = word.lrc;
@@ -1733,8 +1763,12 @@ async function mergeDeezerLyricsResults(results) {
 
   return {
     ...base,
-    source: hasWordSync ? "deezer_pipe_graphql+deezer_gateway" : (base.source || "deezer_gateway"),
-    syncType: hasWordSync ? "WORD_BY_WORD" : (hasLineSync ? "LINE_BY_LINE" : "UNSYNCED"),
+    source: hasWordSync
+      ? "deezer_pipe_graphql+deezer_gateway"
+      : (base.source || "deezer_gateway"),
+    syncType: hasWordSync
+      ? "WORD_BY_WORD"
+      : (hasLineSync ? "LINE_BY_LINE" : "UNSYNCED"),
     hasWordSync,
     hasLineSync,
     id: base.id || word?.id || line?.id || null,
@@ -1752,11 +1786,11 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
   const songId = String(trackId);
 
   const mem = lyricsMemoryCache.get(songId);
-  if (mem && mem.hasWordSync) return mem;
+  if (mem && hasUsableDeezerLyrics(mem)) return mem;
 
   const cacheKey = sharedCacheKey("lyrics-v2", songId);
   const cached = await getSharedCache(env, cacheKey);
-  if (cached?.hasWordSync) {
+  if (hasUsableDeezerLyrics(cached)) {
     lyricsMemoryCache.set(songId, cached, 1000 * 60 * 60);
     return cached;
   }
@@ -1822,7 +1856,7 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
 
   const finalLyrics = await mergeDeezerLyricsResults(attempts);
 
-  if (finalLyrics && (finalLyrics.plain || finalLyrics.lrc || finalLyrics.hasWordSync || finalLyrics.hasLineSync)) {
+  if (hasUsableDeezerLyrics(finalLyrics)) {
     lyricsMemoryCache.set(songId, finalLyrics, 1000 * 60 * 60 * 2);
     await putSharedCache(env, cacheKey, finalLyrics, 86400 * 30);
   }
