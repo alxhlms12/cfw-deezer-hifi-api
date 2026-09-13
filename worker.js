@@ -1,4 +1,4 @@
-// cfw-deezer-hifi-api-v1.4.22-optimized
+// cfw-deezer-hifi-api-v1.4.23-optimized
 // Playback fix: /stream Range requests bypass the generic API rate limiter so continuous audio cannot be interrupted by 429 responses.
 // Playback hardening: authenticated playback entry points require signed
 // bootstrap tokens by default; tokens remain reusable until their normal expiry.
@@ -12,7 +12,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.4.22";
+const API_VERSION = "1.4.23";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -1501,22 +1501,14 @@ async function getPersonalizedRecommendations(env, allowedSlots = null, limit = 
 const GQL_LYRICS_QUERY = `
 query GetLyrics($trackId: String!) {
   track(trackId: $trackId) {
-    id
     lyrics {
-      id
       text
       ...SynchronizedWordByWordLines
       ...SynchronizedLines
-      licence
-      copyright
-      writers
-      __typename
     }
-    __typename
   }
 }
 fragment SynchronizedWordByWordLines on Lyrics {
-  id
   synchronizedWordByWordLines {
     start
     end
@@ -1524,23 +1516,16 @@ fragment SynchronizedWordByWordLines on Lyrics {
       start
       end
       word
-      __typename
     }
-    __typename
   }
-  __typename
 }
 fragment SynchronizedLines on Lyrics {
-  id
   synchronizedLines {
     lrcTimestamp
     line
-    lineTranslated
     milliseconds
     duration
-    __typename
   }
-  __typename
 }
 `;
 
@@ -1612,6 +1597,24 @@ async function getLyricsFromPipeGQL(arl, trackId, env = null) {
       if (jwt) {
         resp = await execute(jwt);
         result = await readResponseLimited(resp);
+      }
+    }
+
+    const graphErrors = Array.isArray(result.json?.errors) ? result.json.errors : [];
+    if (graphErrors.length) {
+      // A schema/auth error can be returned with HTTP 200. Treat auth/JWT
+      // errors exactly like a 401 so a fresh Pipe JWT gets one clean retry.
+      const authError = graphErrors.some(e => /token|auth|jwt|signature|unauthor/i.test(String(e?.message || "")));
+      if (authError && jwt) {
+        jwtCache.delete(String(arl));
+        const freshJwt = await getPipeJwt(arl, true, env);
+        if (freshJwt && freshJwt !== jwt) {
+          const retryResp = await execute(freshJwt);
+          const retryResult = await readResponseLimited(retryResp);
+          if (!retryResult.json?.errors?.length) {
+            result = retryResult;
+          }
+        }
       }
     }
 
@@ -1751,7 +1754,7 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
   const mem = lyricsMemoryCache.get(songId);
   if (mem && mem.hasWordSync) return mem;
 
-  const cacheKey = sharedCacheKey("lyrics", songId);
+  const cacheKey = sharedCacheKey("lyrics-v2", songId);
   const cached = await getSharedCache(env, cacheKey);
   if (cached?.hasWordSync) {
     lyricsMemoryCache.set(songId, cached, 1000 * 60 * 60);
@@ -4971,7 +4974,7 @@ const worker = {
         const session = pickAuxiliarySession(pools, env) || pools.lossless[0]?.session || pools.lossy[0]?.session;
         const lyrics = await getDeezerLyrics(session, segments[1], env);
         if (!lyrics) return apiErrorResponse("Lyrics not found", 404, null, env);
-        return catalogResponseForRequest({ version: API_VERSION, track_id: segments[1], data: lyrics }, 200, 60, env, apiToken, clientIp, clientUserAgentHash);
+        return catalogResponseForRequest({ version: API_VERSION, track_id: segments[1], data: lyrics }, 200, 0, env, apiToken, clientIp, clientUserAgentHash);
       } catch (error) {
         return publicError("LYRICS_REQUEST_FAILED", 502, env, requestId);
       }
