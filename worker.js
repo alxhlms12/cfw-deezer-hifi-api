@@ -1,10 +1,18 @@
+// cfw-deezer-hifi-api-v1.4.20-optimized
+// Playback fix: /stream Range requests bypass the generic API rate limiter so continuous audio cannot be interrupted by 429 responses.
+// Playback hardening: authenticated playback entry points require signed
+// bootstrap tokens by default; tokens remain reusable until their normal expiry.
+// Production optimization pass: cached hot-path crypto, in-flight upstream
+// coalescing, compact JSON by default, strict bootstrap/session token typing,
+// and unique non-coalesced 256-bit bootstrap nonces.
+// Derived from cfw-deezer-hifi-api-v11-random-nonce.
 const DEEZER_GW = "https://www.deezer.com/ajax/gw-light.php";
 const DEEZER_MEDIA_API = "https://media.deezer.com/v1/get_url";
 const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.4.19";
+const API_VERSION = "1.4.20";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -304,7 +312,21 @@ const rateLimitMap = new BoundedMap(5000);
 
 async function checkRateLimit(request, env, authToken = "anonymous") {
   const route = new URL(request.url).pathname || "/";
-  const key = `${authToken || "anonymous"}:${route.split("/")[1] || "root"}`;
+  const routeName = route.split("/")[1] || "root";
+
+  // Audio data-plane requests are intentionally exempt from the generic API
+  // rate limiter. A browser/player legitimately issues repeated HTTP Range
+  // requests while streaming one track, and counting every Range request as
+  // an API request can terminate playback with a 429 mid-song.
+  //
+  // Stream-entry routes such as /stream-track remain rate limited because
+  // they perform resolution/session work. Only the actual /stream data path
+  // is exempt, including its repeated Range requests.
+  if (routeName === "stream") {
+    return { limited: false, exempt: true, distributed: false };
+  }
+
+  const key = `${authToken || "anonymous"}:${routeName}`;
 
   if (env?.RATE_LIMITER?.limit) {
     try {
@@ -3971,7 +3993,7 @@ const ENVIRONMENT_VARIABLES = {
   SEARCH_CACHE_TTL_SECONDS: "Shared public catalog/search cache lifetime in seconds; defaults to 30 and is clamped to 5-3600.",
   CACHE_TTL_DAYS: "Default shared-cache TTL when a cache write does not provide its own TTL; defaults to 30 days.",
   RATE_LIMITER: "Optional Cloudflare Rate Limiting binding used for distributed request limits.",
-  RATE_LIMIT: "Fallback in-worker requests-per-second limit when RATE_LIMITER is not used.",
+  RATE_LIMIT: "Fallback in-worker requests-per-second limit when RATE_LIMITER is not used. The actual /stream audio data path is exempt because continuous playback legitimately generates repeated HTTP Range requests; stream-entry/API routes remain rate limited.",
   RATE_LIMIT_FAIL_CLOSED: "Set true to reject requests if the distributed rate-limit binding fails.",
   SPARE_LOSSLESS_ARL: "Set false to avoid preferring a spare lossy session for auxiliary metadata/lyrics work.",
   PRETTY_JSON: "Set true to pretty-print JSON responses. Defaults to false for lower CPU use and smaller/faster responses.",
@@ -4072,7 +4094,7 @@ function buildDocs(requestUrl, env) {
     SEARCH_CACHE_TTL_SECONDS: { type: "number", secret: false, default: "30", range: "5-3600", effect: "TTL for public Deezer catalog/search responses. Results are also kept in a small per-isolate memory cache for the same TTL, and identical concurrent misses are coalesced when shared caching is enabled." },
     CACHE_TTL_DAYS: { type: "number", secret: false, default: "30", effect: "Default expiration in days for shared KV cache writes that do not supply their own TTL." },
     RATE_LIMITER: { type: "Cloudflare Rate Limiting binding", secret: false, default: "not bound", effect: "Optional distributed rate limiter. When present and operational, its limit({key}) result takes precedence over the local fallback limiter." },
-    RATE_LIMIT: { type: "number", secret: false, default: "disabled", effect: "Fallback local requests-per-second limit when RATE_LIMITER is unavailable or not configured. The local implementation uses a 2.5-second window." },
+    RATE_LIMIT: { type: "number", secret: false, default: "disabled", effect: "Fallback local requests-per-second limit when RATE_LIMITER is unavailable or not configured. The local implementation uses a 2.5-second window. The actual /stream audio data path is exempt so repeated Range requests cannot terminate playback with 429." },
     RATE_LIMIT_FAIL_CLOSED: { type: "boolean string", secret: false, default: "false", effect: "When true, a RATE_LIMITER binding error rejects the request instead of falling back to the local limiter." },
     SPARE_LOSSLESS_ARL: { type: "boolean string", secret: false, default: "true", effect: "When true, auxiliary metadata/lyrics work prefers a lossy ARL as a spare so lossless-capable sessions remain available for playback." },
     PRETTY_JSON: { type: "boolean string", secret: false, default: "false", effect: "When false, JSON responses are compact to reduce CPU, bandwidth, and latency. Set true for human-readable JSON." },
@@ -4115,7 +4137,7 @@ function buildDocs(requestUrl, env) {
         "2. Validate URL/query envelope limits and normalize the route path.",
         "3. Serve /docs and the bare root status before normal client authentication.",
         "4. Authenticate the client using PUBLIC_API, API_KEY slots, Authorization, X-API-Key, and optionally query-string api_key/key.",
-        "5. Apply distributed RATE_LIMITER when configured, otherwise use the local limiter controlled by RATE_LIMIT.",
+        "5. Apply distributed RATE_LIMITER when configured, otherwise use the local limiter controlled by RATE_LIMIT. The /stream audio data path is exempt because continuous HTTP Range requests are part of normal playback.",
         "6. Enforce optional MAINTENANCE_MODE, feature-disable flags, and route-specific protections.",
         "7. Resolve catalog data, Deezer sessions, lyrics, recommendations, or playback according to the requested route.",
         "8. Normalize track/album/artist/playlist data and decorate authenticated streamUrl values with client identity plus a fresh bootstrap token.",
