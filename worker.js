@@ -1,4 +1,4 @@
-// cfw-deezer-hifi-api-v1.4.21-optimized
+// cfw-deezer-hifi-api-v1.4.22-optimized
 // Playback fix: /stream Range requests bypass the generic API rate limiter so continuous audio cannot be interrupted by 429 responses.
 // Playback hardening: authenticated playback entry points require signed
 // bootstrap tokens by default; tokens remain reusable until their normal expiry.
@@ -12,7 +12,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.4.21";
+const API_VERSION = "1.4.22";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -1137,7 +1137,13 @@ async function getPipeJwt(arl, forceRefresh = false, env = null) {
 
   if (!forceRefresh) {
     const cachedJwt = jwtCache.get(cleanArl);
-    if (cachedJwt) return cachedJwt;
+    if (cachedJwt) {
+      // Pipe JWTs are short-lived. Validate the token's real exp claim instead
+      // of trusting only the local cache TTL, with a 60-second safety margin.
+      const cachedExpiry = getJwtExpiryMs(cachedJwt);
+      if (!cachedExpiry || cachedExpiry > Date.now() + 60_000) return cachedJwt;
+      jwtCache.delete(cleanArl);
+    }
   }
 
   // Pipe authentication uses ARL -> JWT. Deezer returns text/plain
@@ -1173,10 +1179,15 @@ async function getPipeJwt(arl, forceRefresh = false, env = null) {
     }
 
     const expiry = getJwtExpiryMs(jwt);
-    const ttl = expiry
-      ? Math.max(30_000, Math.min(330_000, expiry - Date.now() - 30_000))
-      : 300_000;
-    jwtCache.set(cleanArl, jwt, ttl);
+    const now = Date.now();
+    // Deezer Pipe JWTs are currently 360 seconds. Cache only while the token
+    // has at least 60 seconds of real lifetime remaining.
+    if (expiry > now + 60_000) {
+      const ttl = Math.max(1_000, Math.min(300_000, expiry - now - 60_000));
+      jwtCache.set(cleanArl, jwt, ttl);
+    } else {
+      jwtCache.delete(cleanArl);
+    }
     return jwt;
   } catch (_) {
     jwtCache.delete(cleanArl);
@@ -1766,8 +1777,12 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
 
   try {
     const pools = await getCandidatePools(env, null);
-    for (const poolName of ["lossless", "lossy"]) {
-      for (const candidate of (pools?.[poolName] || [])) addCandidate(candidate?.session);
+    // Include active AND currently-unverified slots. getCandidatePools() may
+    // leave unverified ARLs untouched when other sessions are already active.
+    for (const poolName of ["lossless", "lossy", "unverified"]) {
+      for (const candidate of (pools?.[poolName] || [])) {
+        addCandidate(candidate?.session || candidate);
+      }
     }
   } catch (_) {}
 
@@ -1781,7 +1796,7 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
   // GraphQL/GetLyrics. This avoids making the GW result suppress richer Pipe
   // word-by-word data, and avoids making one bad backend suppress the other.
   const attempts = [];
-  for (const candidate of candidates.slice(0, 10)) {
+  for (const candidate of candidates.slice(0, 50)) {
     let session = candidate.session;
     if (!session?.sid || !session?.apiToken) {
       session = await getOrRenewSession(candidate.arl, env).catch(() => null);
