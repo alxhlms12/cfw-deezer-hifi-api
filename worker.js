@@ -1,19 +1,10 @@
-// cfw-deezer-hifi-api-v1.4.28
-// Secure instance-to-instance ARL federation added on top of the v1.4.27 racing/latency pass.
-// Playback fix: /stream Range requests bypass the generic API rate limiter so continuous audio cannot be interrupted by 429 responses.
-// Playback hardening: authenticated playback entry points require signed
-// bootstrap tokens by default; tokens remain reusable until their normal expiry.
-// Production optimization pass: cached hot-path crypto, in-flight upstream
-// coalescing, compact JSON by default, strict bootstrap/session token typing,
-// and unique non-coalesced 256-bit bootstrap nonces.
-// Derived from cfw-deezer-hifi-api-v11-random-nonce.
 const DEEZER_GW = "https://www.deezer.com/ajax/gw-light.php";
 const DEEZER_MEDIA_API = "https://media.deezer.com/v1/get_url";
 const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.4.28";
+const API_VERSION = "1.4.29";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -4503,6 +4494,11 @@ function buildDocs(requestUrl, env) {
             : "No client API keys are configured and REQUIRE_API_KEY=false, so normal API requests are open."
         };
 
+  const authenticationExceptions = {
+    public_without_client_key: ["/ping", "/routing", "/docs"],
+    note: "/ping may contact Deezer using configured ARLs for health/capability checks, but it never returns streamUrl, media URL, track token, lyrics, or protected catalog payloads to the caller."
+  };
+
   const envDocs = {
     CORS_ALLOW_ORIGIN: { type: "string", secret: false, default: "*", effect: "Sets Access-Control-Allow-Origin. Vary: Origin is also emitted." },
     PUBLIC_API: { type: "boolean string", secret: false, default: "false", effect: "When true, bypasses normal client API-key authentication." },
@@ -4629,7 +4625,7 @@ function buildDocs(requestUrl, env) {
         SPARE_LOSSLESS_ARL: "Lets auxiliary metadata/lyrics work prefer a spare lossy-capable ARL so lossless-capable playback accounts are preserved."
       },
       diagnostics: {
-        "/ping": "Parallel ARL health/capability check with per-slot status.",
+        "/ping": "Public parallel ARL health/capability check with per-slot status; no client API key is required because it reports health/capability only and never returns protected Deezer media data.",
         "/routing": "Public live routing, authentication, playback-security, timeout, route, and hardening configuration summary; no API key required.",
         "/env": "Admin-only non-secret environment diagnostics. Secret-like names/values are filtered and never exposed.",
         "/docs": "Public machine-readable documentation generated from the current Worker origin and environment configuration.",
@@ -4689,7 +4685,7 @@ function buildDocs(requestUrl, env) {
         "Set DEEZER_ARL as a Worker secret.",
         "Set API_KEY as a Worker secret.",
         "Deploy with npx wrangler deploy.",
-        "Call /ping with Authorization: Bearer <the API_KEY value> to verify the configured ARL."
+        "Call /ping without a client API key to verify configured ARL health and capability."
       ],
       public_api: [
         "Save the Worker as worker.js.",
@@ -4806,7 +4802,7 @@ function buildDocs(requestUrl, env) {
     },
     troubleshooting: {
       ping_fails: "Check DEEZER_ARL secrets first. Run /ping and inspect each configured slot's status and tier.",
-      unauthorized: "If API keys are configured, send Authorization: Bearer <API_KEY> or X-API-Key. If no keys are configured, set PUBLIC_API=true or REQUIRE_API_KEY=false according to the desired deployment mode.",
+      unauthorized: "Protected Deezer data routes require Authorization: Bearer <API_KEY> or X-API-Key when client keys are configured. Public informational routes such as /ping and /routing do not require a client API key.",
       env_returns_403: "Supply ADMIN_API_KEY using Authorization: Bearer <ADMIN_API_KEY> or X-API-Key. /env never exposes secret values.",
       flac_falls_back: "The selected ARL may not have lossless capability, the Deezer media authorization may have expired, or the FLAC media URL request may have failed. /ping shows the detected account tier.",
       stream_rejected: "The /stream URL must use HTTPS and its hostname must match STREAM_CDN_HOSTS. The default allowlist is *.dzcdn.net and media.deezer.com.",
@@ -4968,9 +4964,17 @@ const worker = {
     // Keep rate limiting in place so making this endpoint credential-free does not
     // make it an unlimited request target.
     const isPublicRouting = primaryRoute === "routing";
+    const isPublicPing = primaryRoute === "ping" || requestUrl.searchParams.has("ping");
     const isAdminEnv = primaryRoute === "env";
-    const auth = (isPublicRouting || isAdminEnv)
-      ? { authorized: true, allowedSlots: null, tokenId: isPublicRouting ? "public-routing" : "admin-env" }
+    // /ping is intentionally credential-free. It performs an ARL health/capability
+    // check but never returns a Deezer streamUrl, media URL, track token, lyrics,
+    // catalog payload, or other protected Deezer data to the caller.
+    const auth = (isPublicRouting || isPublicPing || isAdminEnv)
+      ? {
+          authorized: true,
+          allowedSlots: null,
+          tokenId: isPublicRouting ? "public-routing" : (isPublicPing ? "public-ping" : "admin-env")
+        }
       : authenticateRequest(request, env);
     if (!auth.authorized) {
       return publicError("UNAUTHORIZED", 401, env, requestId);
@@ -5030,7 +5034,9 @@ const worker = {
         if (!arls.length) return jsonResponse({ error: "No DEEZER_ARL configured" }, 500, {}, env);
 
         let configured = arls;
-        if (auth.allowedSlots && auth.allowedSlots.size > 0) {
+        // /ping is public and therefore reports all configured local/shared ARLs.
+        // Authenticated callers can still be slot-filtered when this block is reused.
+        if (!isPublicPing && auth.allowedSlots && auth.allowedSlots.size > 0) {
           const allowShared = envBoolean(env, "ARL_SHARE_ACCESS", false);
           configured = configured.filter(c => c.shared ? allowShared : auth.allowedSlots.has(c.slot));
         }
