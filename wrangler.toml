@@ -6,10 +6,6 @@ workers_dev = true
 
 # Cloudflare Workers Free plan safety ceiling.
 # Free currently allows 10 ms CPU per HTTP invocation.
-[limits]
-cpu_ms = 10
-subrequests = 50
-
 # ============================================================
 # DEFAULT ENVIRONMENT
 # ============================================================
