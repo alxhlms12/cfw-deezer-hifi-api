@@ -12,7 +12,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.4.24";
+const API_VERSION = "1.4.25";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -1785,8 +1785,9 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
   if (!trackId) return null;
   const songId = String(trackId);
 
+  // Hot caches are intentionally checked before any Deezer network request.
   const mem = lyricsMemoryCache.get(songId);
-  if (mem && hasUsableDeezerLyrics(mem)) return mem;
+  if (hasUsableDeezerLyrics(mem)) return mem;
 
   const cacheKey = sharedCacheKey("lyrics-v2", songId);
   const cached = await getSharedCache(env, cacheKey);
@@ -1795,75 +1796,98 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
     return cached;
   }
 
-  // Lyrics are intentionally Deezer-private only. Do not use api.deezer.com,
-  // third-party lyrics providers, ISRC lookups, or public search here.
-  // Build a small authenticated session pool so a stale/broken ARL slot does
-  // not make a track look like it has no lyrics.
+  // Fast path: use the already-selected authenticated session immediately.
+  // Pipe is queried first because it is the richest private lyrics surface and
+  // can return word-sync, line-sync, or plain lyrics in one request.
+  let primaryArl = typeof sessionOrArl === "string" ? sessionOrArl : sessionOrArl?.arl;
+  let primarySession = typeof sessionOrArl === "object" && sessionOrArl?.sid ? sessionOrArl : null;
+
+  if (!primaryArl) {
+    try {
+      const { arls } = getMemoizedConfig(env);
+      primaryArl = arls?.[0]?.value || null;
+    } catch (_) {}
+  }
+
+  if (primaryArl && !primarySession) {
+    primarySession = await getOrRenewSession(primaryArl, env).catch(() => null);
+  }
+
+  if (primaryArl) {
+    // Normal case: one cached-JWT Pipe request. If Pipe has usable lyrics,
+    // return immediately. Do not make a second request just to compare APIs.
+    const pipeLyrics = await getLyricsFromPipeGQL(primaryArl, songId, env);
+    if (hasUsableDeezerLyrics(pipeLyrics)) {
+      lyricsMemoryCache.set(songId, pipeLyrics, 1000 * 60 * 60 * 2);
+      await putSharedCache(env, cacheKey, pipeLyrics, 86400 * 30);
+      return pipeLyrics;
+    }
+
+    // Fallback: the gateway can still provide lyrics when Pipe is unavailable.
+    const gwLyrics = await getLyricsFromGwLight(primarySession, songId, env);
+    if (hasUsableDeezerLyrics(gwLyrics)) {
+      lyricsMemoryCache.set(songId, gwLyrics, 1000 * 60 * 60 * 2);
+      await putSharedCache(env, cacheKey, gwLyrics, 86400 * 30);
+      return gwLyrics;
+    }
+  }
+
+  // Only build the full ARL failover pool after the primary authenticated
+  // session has actually failed. This keeps the common path to one upstream
+  // lyrics request and preserves the existing 50-ARL reliability net.
   const candidates = [];
-  const seenArls = new Set();
+  const seenArls = new Set(primaryArl ? [String(primaryArl)] : []);
   const addCandidate = (candidate) => {
     if (!candidate) return;
     const arl = typeof candidate === "string" ? candidate : candidate.arl;
     if (!arl || seenArls.has(String(arl))) return;
     seenArls.add(String(arl));
-    candidates.push({ arl: String(arl), session: typeof candidate === "object" ? candidate : null });
+    candidates.push({
+      arl: String(arl),
+      session: typeof candidate === "object" ? candidate.session || candidate : null,
+    });
   };
-
-  if (typeof sessionOrArl === "string") addCandidate(sessionOrArl);
-  else if (sessionOrArl?.arl) addCandidate(sessionOrArl);
 
   try {
     const pools = await getCandidatePools(env, null);
-    // Include active AND currently-unverified slots. getCandidatePools() may
-    // leave unverified ARLs untouched when other sessions are already active.
     for (const poolName of ["lossless", "lossy", "unverified"]) {
-      for (const candidate of (pools?.[poolName] || [])) {
-        addCandidate(candidate?.session || candidate);
-      }
+      for (const candidate of (pools?.[poolName] || [])) addCandidate(candidate);
     }
   } catch (_) {}
 
   if (!candidates.length) {
-    const { arls } = getMemoizedConfig(env);
-    for (const item of (arls || [])) addCandidate(item?.value || item);
+    try {
+      const { arls } = getMemoizedConfig(env);
+      for (const item of (arls || [])) addCandidate(item?.value || item);
+    } catch (_) {}
   }
 
-  // Try authenticated Deezer sessions independently. Each session uses both
-  // private lyric surfaces in parallel: gw-light.php/song.getLyrics and Pipe
-  // GraphQL/GetLyrics. This avoids making the GW result suppress richer Pipe
-  // word-by-word data, and avoids making one bad backend suppress the other.
-  const attempts = [];
+  // Failover remains sequential so one broken ARL does not create a burst of
+  // 50 simultaneous authenticated requests. Each fallback stops immediately
+  // on any usable lyric representation, including line-only lyrics.
   for (const candidate of candidates.slice(0, 50)) {
     let session = candidate.session;
     if (!session?.sid || !session?.apiToken) {
       session = await getOrRenewSession(candidate.arl, env).catch(() => null);
     }
 
-    const [gwLyrics, pipeLyrics] = await Promise.all([
-      session?.sid && session?.apiToken
-        ? getLyricsFromGwLight(session, songId, env)
-        : Promise.resolve(null),
-      getLyricsFromPipeGQL(candidate.arl, songId, env),
-    ]);
+    const pipeLyrics = await getLyricsFromPipeGQL(candidate.arl, songId, env);
+    if (hasUsableDeezerLyrics(pipeLyrics)) {
+      lyricsMemoryCache.set(songId, pipeLyrics, 1000 * 60 * 60 * 2);
+      await putSharedCache(env, cacheKey, pipeLyrics, 86400 * 30);
+      return pipeLyrics;
+    }
 
-    const merged = await mergeDeezerLyricsResults([pipeLyrics, gwLyrics]);
-    if (merged) attempts.push(merged);
-
-    // Word-by-word is the richest representation. Stop immediately once Deezer
-    // has supplied it, rather than spending more upstream requests.
-    if (merged?.hasWordSync) break;
+    const gwLyrics = await getLyricsFromGwLight(session, songId, env);
+    if (hasUsableDeezerLyrics(gwLyrics)) {
+      lyricsMemoryCache.set(songId, gwLyrics, 1000 * 60 * 60 * 2);
+      await putSharedCache(env, cacheKey, gwLyrics, 86400 * 30);
+      return gwLyrics;
+    }
   }
 
-  const finalLyrics = await mergeDeezerLyricsResults(attempts);
-
-  if (hasUsableDeezerLyrics(finalLyrics)) {
-    lyricsMemoryCache.set(songId, finalLyrics, 1000 * 60 * 60 * 2);
-    await putSharedCache(env, cacheKey, finalLyrics, 86400 * 30);
-  }
-
-  return finalLyrics;
+  return null;
 }
-
 
 async function getTrackTokensUncached(arl, session, trackId) {
   const sngId = parseInt(trackId, 10) || trackId;
