@@ -21,7 +21,7 @@ Replace `your-worker` with the hostname of your deployed Cloudflare Worker.
 Example:
 
 ```text
-https://your-worker.workers.dev/docs
+https://cfw-deezer-hifi-api.alxhlms.workers.dev/docs
 ```
 
 ## Features
@@ -52,7 +52,7 @@ Do not put private ARLs, API keys, or other secrets directly into `worker.js`.
 
 Use Cloudflare Worker environment variables and secrets as described in:
 
-**https://your-worker.workers.dev/docs**
+**https://cfw-deezer-hifi-api.alxhlms.workers.dev/docs**
 
 ## License
 
