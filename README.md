@@ -4,7 +4,7 @@ A Cloudflare Worker API for Deezer catalog access, lossless HiFi playback resolu
 
 ## Documentation
 
-The complete setup guide, configuration reference, environment variables, routing information, API endpoints, deployment instructions, troubleshooting, and usage documentation are available from the Worker itself:
+The complete setup guide, configuration reference, environment variables, routing information, API endpoints, deployment instructions, troubleshooting, and usage documentation are available from the Worker itself, yes i know, some routing's are unstable and dont work such as test-routing, it was supposed to be removed, will be finalized next commit...:
 
 **https://your-worker.workers.dev/docs**
 
@@ -52,7 +52,7 @@ Do not put private ARLs, API keys, or other secrets directly into `worker.js`.
 
 Use Cloudflare Worker environment variables and secrets as described in:
 
-**https://cfw-deezer-hifi-api.alxhlms.workers.dev/docs**
+**https://cfw-deezer-hifi-api.alxhlms12.workers.dev/config**
 
 ## License
 
