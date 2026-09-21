@@ -1,4 +1,4 @@
-// cfw-deezer-hifi-api-v1.5.0
+// cfw-deezer-hifi-api-v1.5.2-alpha
 // Public /ping authentication exception added on top of the v1.4.28 routing/racing pass.
 // Playback fix: /stream Range requests bypass the generic API rate limiter so continuous audio cannot be interrupted by 429 responses.
 // Playback hardening: authenticated playback entry points require signed
@@ -13,7 +13,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.5.0";
+const API_VERSION = "1.5.2-alpha";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -661,7 +661,11 @@ function pickBestTrack(tracks, queryInfo, allowAlt = false, preferExplicit = tru
       return titleMatches && artistMatches;
     });
 
-    if (relevant.length > 0) candidates = relevant;
+    if (relevant.length > 0) {
+      candidates = relevant;
+    } else {
+      return null;
+    }
   }
 
   if (preferExplicit) {
@@ -2302,7 +2306,7 @@ async function discoverTrack({ id, isrc, query, title, artist }, env = null, all
       return kvSearch;
     }
 
-    const resp = await fetchWithTimeout(`https://api.deezer.com/search?q=${encodeURIComponent(queryInfo.clean)}&limit=10`, {
+    const resp = await fetchWithTimeout(`https://api.deezer.com/search?q=${encodeURIComponent(queryInfo.clean)}&limit=25`, {
       headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
     }, env);
     const result = await readResponseLimited(resp);
