@@ -4,9 +4,9 @@ A Cloudflare Worker API for Deezer catalog access, lossless HiFi playback resolu
 
 ## Documentation
 
-The complete setup guide, configuration reference, environment variables, routing information, API endpoints, deployment instructions, troubleshooting, and usage documentation are available from the Worker itself, yes i know, some routing's are unstable and dont work such as test-routing, it was supposed to be removed, will be finalized next commit, also I don't believe the default for chunking is safe for FLAC:
+The complete setup guide, configuration reference, environment variables, routing information, API endpoints, deployment instructions, troubleshooting, and usage documentation are available from the Worker itself:
 
-**https://your-worker.workers.dev/docs**
+**https://cfw-deezer-hifi-api.your-subdomain.workers.dev/docs**
 
 Replace `your-worker` with the hostname of your deployed Cloudflare Worker.
 
@@ -21,7 +21,7 @@ Replace `your-worker` with the hostname of your deployed Cloudflare Worker.
 Example:
 
 ```text
-https://cfw-deezer-hifi-api.alxhlms.workers.dev/docs
+https://cfw-deezer-hifi-api.your-subdomain.workers.dev/docs
 ```
 
 ## Features
