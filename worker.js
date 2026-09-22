@@ -1,4 +1,4 @@
-// cfw-deezer-hifi-api-v1.5.0
+// cfw-deezer-hifi-api-v1.5.4-alpha
 // Public /ping authentication exception added on top of the v1.4.28 routing/racing pass.
 // Playback fix: /stream Range requests bypass the generic API rate limiter so continuous audio cannot be interrupted by 429 responses.
 // Playback hardening: authenticated playback entry points require signed
@@ -13,7 +13,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.5.3";
+const API_VERSION = "1.5.4-alpha";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -121,6 +121,7 @@ class BoundedMap {
 
 const sessionCache = new BoundedMap(64);
 const jwtCache = new BoundedMap(64);
+const jwtInflight = new Map();
 const cipherCache = new BoundedMap(128);
 const trackMemoryCache = new BoundedMap(512);
 const albumMemoryCache = new BoundedMap(256);
@@ -1162,64 +1163,85 @@ async function getPipeJwt(arl, forceRefresh = false, env = null) {
   const cleanArl = String(arl || "").trim();
   if (!cleanArl) return null;
 
-  if (!forceRefresh) {
+  const getValidCached = () => {
     const cachedJwt = jwtCache.get(cleanArl);
-    if (cachedJwt) {
-      // Pipe JWTs are short-lived. Validate the token's real exp claim instead
-      // of trusting only the local cache TTL, with a 60-second safety margin.
-      const cachedExpiry = getJwtExpiryMs(cachedJwt);
-      if (!cachedExpiry || cachedExpiry > Date.now() + 60_000) return cachedJwt;
-      jwtCache.delete(cleanArl);
-    }
-  }
-
-  // Pipe authentication uses ARL -> JWT. Deezer returns text/plain
-  // containing JSON, so parsing only response.json is not sufficient.
-  try {
-    const resp = await fetchWithTimeout(DEEZER_AUTH_ARL, {
-      method: "POST",
-      headers: {
-        "User-Agent": BROWSER_HEADERS["User-Agent"],
-        "Origin": "https://www.deezer.com",
-        "Referer": "https://www.deezer.com/",
-        Cookie: `arl=${cleanArl}`,
-        Accept: "application/json, text/plain, */*",
-      },
-      body: "",
-    }, env);
-
-    const result = await readResponseLimited(resp);
-    if (!result.ok) {
+    if (!cachedJwt) return null;
+    const cachedExpiry = getJwtExpiryMs(cachedJwt);
+    if (!cachedExpiry || cachedExpiry <= Date.now() + 60_000) {
       jwtCache.delete(cleanArl);
       return null;
     }
+    return cachedJwt;
+  };
 
-    let payload = result.json;
-    if (!payload && result.text) {
-      try { payload = JSON.parse(String(result.text).trim()); } catch (_) {}
-    }
+  if (!forceRefresh) {
+    const cached = getValidCached();
+    if (cached) return cached;
+  }
 
-    const jwt = String(payload?.jwt || payload?.token || payload?.access_token || "").trim();
-    if (!jwt) {
+  // Serialize refreshes for the same ARL. Pipe JWTs are short-lived, so
+  // concurrent lyrics requests must not all perform their own ARL exchange.
+  const existing = jwtInflight.get(cleanArl);
+  if (existing) return existing;
+
+  const refreshPromise = (async () => {
+    try {
+      // A forced refresh may have been requested by several callers at once.
+      // If another caller already populated a fresh token before this promise
+      // started, reuse it instead of issuing a second auth request.
+      if (forceRefresh) {
+        const alreadyFresh = getValidCached();
+        if (alreadyFresh) return alreadyFresh;
+      }
+
+      const resp = await fetchWithTimeout(DEEZER_AUTH_ARL, {
+        method: "POST",
+        headers: {
+          "User-Agent": BROWSER_HEADERS["User-Agent"],
+          "Origin": "https://www.deezer.com",
+          "Referer": "https://www.deezer.com/",
+          Cookie: `arl=${cleanArl}`,
+          Accept: "application/json, text/plain, */*",
+        },
+        body: "",
+      }, env);
+
+      const result = await readResponseLimited(resp);
+      if (!result.ok) {
+        jwtCache.delete(cleanArl);
+        return null;
+      }
+
+      let payload = result.json;
+      if (!payload && result.text) {
+        try { payload = JSON.parse(String(result.text).trim()); } catch (_) {}
+      }
+
+      const jwt = String(payload?.jwt || payload?.token || payload?.access_token || "").trim();
+      if (!jwt) {
+        jwtCache.delete(cleanArl);
+        return null;
+      }
+
+      const expiry = getJwtExpiryMs(jwt);
+      const now = Date.now();
+      if (expiry > now + 60_000) {
+        const ttl = Math.max(1_000, Math.min(300_000, expiry - now - 60_000));
+        jwtCache.set(cleanArl, jwt, ttl);
+      } else {
+        jwtCache.delete(cleanArl);
+      }
+      return jwt;
+    } catch (_) {
       jwtCache.delete(cleanArl);
       return null;
+    } finally {
+      jwtInflight.delete(cleanArl);
     }
+  })();
 
-    const expiry = getJwtExpiryMs(jwt);
-    const now = Date.now();
-    // Deezer Pipe JWTs are currently 360 seconds. Cache only while the token
-    // has at least 60 seconds of real lifetime remaining.
-    if (expiry > now + 60_000) {
-      const ttl = Math.max(1_000, Math.min(300_000, expiry - now - 60_000));
-      jwtCache.set(cleanArl, jwt, ttl);
-    } else {
-      jwtCache.delete(cleanArl);
-    }
-    return jwt;
-  } catch (_) {
-    jwtCache.delete(cleanArl);
-    return null;
-  }
+  jwtInflight.set(cleanArl, refreshPromise);
+  return refreshPromise;
 }
 
 const GQL_RECOMMENDATIONS_QUERY = `
@@ -1575,9 +1597,9 @@ function normalizeWordSync(lines) {
     words: Array.isArray(line?.words) ? line.words.map((word) => ({
       start: Number.isFinite(Number(word?.start)) ? Number(word.start) : null,
       end: Number.isFinite(Number(word?.end)) ? Number(word.end) : null,
-      word: word?.word ?? "",
-    })) : [],
-  }));
+      word: typeof word?.word === "string" ? word.word : String(word?.word ?? ""),
+    })).filter(word => word.word.length > 0 || (word.start !== null && word.end !== null)) : [],
+  })).filter(line => Array.isArray(line.words) && line.words.length > 0);
 }
 
 function wordSyncToLrc(wordLines) {
@@ -1587,9 +1609,19 @@ function wordSyncToLrc(wordLines) {
     const words = Array.isArray(line.words) ? line.words : [];
     if (!words.length) continue;
     const start = Number(line.start);
-    const ms = Number.isFinite(start) ? start : Number(words[0]?.start);
+    const firstWordStart = Number(words[0]?.start);
+    const ms = Number.isFinite(start) ? start : firstWordStart;
     const timestamp = Number.isFinite(ms) ? `[${Math.floor(ms / 60000).toString().padStart(2, "0")}:${((ms % 60000) / 1000).toFixed(2).padStart(5, "0")}]` : "";
-    lines.push(`${timestamp}${words.map(w => w.word || "").join("")}`);
+    // Deezer's word payload is the authoritative structure. This LRC is only
+    // a compatibility representation, so preserve explicit whitespace and
+    // avoid destroying word boundaries when the upstream payload omits it.
+    let text = "";
+    for (let i = 0; i < words.length; i++) {
+      const value = String(words[i]?.word ?? "");
+      if (i > 0 && !/^\s/.test(value) && !/\s$/.test(text)) text += " ";
+      text += value;
+    }
+    lines.push(`${timestamp}${text}`);
   }
   return lines.length ? lines.join("\n") : null;
 }
@@ -1751,61 +1783,65 @@ function hasUsableDeezerLyrics(value) {
   return false;
 }
 
-async function mergeDeezerLyricsResults(results) {
-  const usable = results.filter(hasUsableDeezerLyrics);
+function mergeDeezerLyricsResults(results) {
+  const usable = (Array.isArray(results) ? results : []).filter(hasUsableDeezerLyrics);
   if (!usable.length) return null;
 
-  // Lyrics quality is hierarchical, but every usable tier is valid:
-  // WORD_BY_WORD > LINE_BY_LINE > UNSYNCED.
-  // Line-only lyrics must never collapse to null just because word timing
-  // is unavailable.
   const word = usable.find(x =>
-    x.hasWordSync &&
+    x?.hasWordSync &&
     Array.isArray(x.synchronizedWordByWordLines) &&
     x.synchronizedWordByWordLines.length > 0
-  );
+  ) || null;
+
   const line = usable.find(x =>
-    x.hasLineSync &&
+    x?.hasLineSync &&
     Array.isArray(x.synchronizedLines) &&
     x.synchronizedLines.length > 0
-  );
-  const plain = usable.find(x => typeof x.plain === "string" && x.plain.trim().length > 0);
-  const base = word || line || plain || usable[0];
+  ) || null;
 
-  const hasWordSync = Boolean(word);
-  const hasLineSync = Boolean(line || base?.hasLineSync);
-  const synchronizedWordByWordLines =
-    word?.synchronizedWordByWordLines ||
-    base?.synchronizedWordByWordLines ||
-    null;
-  const synchronizedLines =
-    line?.synchronizedLines ||
-    base?.synchronizedLines ||
-    null;
+  const plain = usable.find(x => typeof x?.plain === "string" && x.plain.trim().length > 0) || null;
+
+  // Prefer the richest synchronized source, but fill missing fields from the
+  // other source instead of discarding them. In particular, a word-sync
+  // response may have timing but no plain text, while the gateway has text.
+  const base = word || line || plain || usable[0];
+  const synchronizedWordByWordLines = word?.synchronizedWordByWordLines || null;
+  const synchronizedLines = line?.synchronizedLines || word?.synchronizedLines || null;
+  const hasWordSync = Boolean(synchronizedWordByWordLines?.length);
+  const hasLineSync = Boolean(synchronizedLines?.length);
 
   let lrc = null;
-  if (hasWordSync && word?.lrc) lrc = word.lrc;
+  if (word?.lrc) lrc = word.lrc;
   else if (line?.lrc) lrc = line.lrc;
-  else lrc = base?.lrc || null;
+  else if (base?.lrc) lrc = base.lrc;
 
   return {
     ...base,
     source: hasWordSync
       ? "deezer_pipe_graphql+deezer_gateway"
-      : (base.source || "deezer_gateway"),
-    syncType: hasWordSync
-      ? "WORD_BY_WORD"
-      : (hasLineSync ? "LINE_BY_LINE" : "UNSYNCED"),
+      : (hasLineSync ? "deezer_gateway" : (base.source || "deezer_gateway")),
+    syncType: hasWordSync ? "WORD_BY_WORD" : (hasLineSync ? "LINE_BY_LINE" : "UNSYNCED"),
     hasWordSync,
     hasLineSync,
-    id: base.id || word?.id || line?.id || null,
-    writers: base.writers || word?.writers || line?.writers || null,
-    copyright: base.copyright || word?.copyright || line?.copyright || null,
-    plain: plain?.plain || base.plain || null,
+    id: base.id || word?.id || line?.id || plain?.id || null,
+    writers: base.writers || word?.writers || line?.writers || plain?.writers || null,
+    copyright: base.copyright || word?.copyright || line?.copyright || plain?.copyright || null,
+    plain: plain?.plain || base.plain || word?.plain || line?.plain || null,
     lrc,
     synchronizedLines,
     synchronizedWordByWordLines,
   };
+}
+
+function getLyricsCacheTtlSeconds(lyrics) {
+  if (lyrics?.hasWordSync && Array.isArray(lyrics.synchronizedWordByWordLines) && lyrics.synchronizedWordByWordLines.length) {
+    return 86400 * 30;
+  }
+  // Do not pin a temporary Pipe failure behind a 30-day line/plain cache.
+  // Re-check weaker results periodically so a later request can upgrade to
+  // Deezer's word-by-word payload when Pipe becomes available again.
+  if (lyrics?.hasLineSync) return 60 * 60 * 6;
+  return 60 * 60 * 2;
 }
 
 async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
@@ -1813,19 +1849,18 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
   const songId = String(trackId);
 
   // Hot caches are intentionally checked before any Deezer network request.
+  // v3 deliberately avoids reusing the older lyrics-v2 cache because v2 could
+  // permanently cache a lower-quality result before the richer source won.
   const mem = lyricsMemoryCache.get(songId);
   if (hasUsableDeezerLyrics(mem)) return mem;
 
-  const cacheKey = sharedCacheKey("lyrics-v2", songId);
+  const cacheKey = sharedCacheKey("lyrics-v3", songId);
   const cached = await getSharedCache(env, cacheKey);
   if (hasUsableDeezerLyrics(cached)) {
     lyricsMemoryCache.set(songId, cached, 1000 * 60 * 60);
     return cached;
   }
 
-  // Fast path: use the already-selected authenticated session immediately.
-  // Pipe is queried first because it is the richest private lyrics surface and
-  // can return word-sync, line-sync, or plain lyrics in one request.
   let primaryArl = typeof sessionOrArl === "string" ? sessionOrArl : sessionOrArl?.arl;
   let primarySession = typeof sessionOrArl === "object" && sessionOrArl?.sid ? sessionOrArl : null;
 
@@ -1840,38 +1875,42 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
     primarySession = await getOrRenewSession(primaryArl, env).catch(() => null);
   }
 
+  // Always collect BOTH lyrics surfaces before deciding what to return.
+  // The Pipe GraphQL surface can contain word-by-word timing while the
+  // gateway can contain plain/line-synchronized lyrics. Racing them and
+  // returning the first usable response was the main source of instability:
+  // a plain/line result could win milliseconds before a word-sync result.
+  const resolveForArl = async (arl, session = null) => {
+    if (!arl) return null;
+
+    const sessionPromise = session?.sid && session?.apiToken
+      ? Promise.resolve(session)
+      : getOrRenewSession(arl, env).catch(() => null);
+
+    const [pipeResult, gatewayResult] = await Promise.allSettled([
+      getLyricsFromPipeGQL(arl, songId, env),
+      sessionPromise.then(activeSession => getLyricsFromGwLight(activeSession, songId, env)),
+    ]);
+
+    const results = [];
+    if (pipeResult.status === "fulfilled" && hasUsableDeezerLyrics(pipeResult.value)) results.push(pipeResult.value);
+    if (gatewayResult.status === "fulfilled" && hasUsableDeezerLyrics(gatewayResult.value)) results.push(gatewayResult.value);
+
+    return mergeDeezerLyricsResults(results);
+  };
+
   if (primaryArl) {
-    // Race the two private Deezer lyrics surfaces instead of waiting for one
-    // to fail before starting the other. Pipe can provide word-sync; the
-    // gateway is often faster for line-sync/plain lyrics. First usable result
-    // wins, which keeps lyrics from becoming a serial latency tax.
-    const sessionPromise = primarySession
-      ? Promise.resolve(primarySession)
-      : getOrRenewSession(primaryArl, env).catch(() => null);
-    const pipePromise = getLyricsFromPipeGQL(primaryArl, songId, env);
-    const gwPromise = sessionPromise.then(session => getLyricsFromGwLight(session, songId, env));
-
-    const racedLyrics = await Promise.any([
-      pipePromise.then(value => {
-        if (!hasUsableDeezerLyrics(value)) throw new Error("Pipe lyrics unavailable");
-        return value;
-      }),
-      gwPromise.then(value => {
-        if (!hasUsableDeezerLyrics(value)) throw new Error("Gateway lyrics unavailable");
-        return value;
-      }),
-    ]).catch(() => null);
-
-    if (hasUsableDeezerLyrics(racedLyrics)) {
-      lyricsMemoryCache.set(songId, racedLyrics, 1000 * 60 * 60 * 2);
-      await putSharedCache(env, cacheKey, racedLyrics, 86400 * 30);
-      return racedLyrics;
+    const primaryLyrics = await resolveForArl(primaryArl, primarySession);
+    if (hasUsableDeezerLyrics(primaryLyrics)) {
+      lyricsMemoryCache.set(songId, primaryLyrics, Math.min(1000 * 60 * 60 * 2, getLyricsCacheTtlSeconds(primaryLyrics) * 1000));
+      await putSharedCache(env, cacheKey, primaryLyrics, getLyricsCacheTtlSeconds(primaryLyrics));
+      return primaryLyrics;
     }
   }
 
   // Only build the full ARL failover pool after the primary authenticated
-  // session has actually failed. This keeps the common path to one upstream
-  // lyrics request and preserves the existing 50-ARL reliability net.
+  // session has actually failed. Fallbacks stay sequential to avoid a burst
+  // of authenticated requests across all configured ARLs.
   const candidates = [];
   const seenArls = new Set(primaryArl ? [String(primaryArl)] : []);
   const addCandidate = (candidate) => {
@@ -1899,27 +1938,12 @@ async function getDeezerLyrics(sessionOrArl, trackId, env = null) {
     } catch (_) {}
   }
 
-  // Failover remains sequential so one broken ARL does not create a burst of
-  // 50 simultaneous authenticated requests. Each fallback stops immediately
-  // on any usable lyric representation, including line-only lyrics.
   for (const candidate of candidates.slice(0, 50)) {
-    let session = candidate.session;
-    if (!session?.sid || !session?.apiToken) {
-      session = await getOrRenewSession(candidate.arl, env).catch(() => null);
-    }
-
-    const pipeLyrics = await getLyricsFromPipeGQL(candidate.arl, songId, env);
-    if (hasUsableDeezerLyrics(pipeLyrics)) {
-      lyricsMemoryCache.set(songId, pipeLyrics, 1000 * 60 * 60 * 2);
-      await putSharedCache(env, cacheKey, pipeLyrics, 86400 * 30);
-      return pipeLyrics;
-    }
-
-    const gwLyrics = await getLyricsFromGwLight(session, songId, env);
-    if (hasUsableDeezerLyrics(gwLyrics)) {
-      lyricsMemoryCache.set(songId, gwLyrics, 1000 * 60 * 60 * 2);
-      await putSharedCache(env, cacheKey, gwLyrics, 86400 * 30);
-      return gwLyrics;
+    const lyrics = await resolveForArl(candidate.arl, candidate.session);
+    if (hasUsableDeezerLyrics(lyrics)) {
+      lyricsMemoryCache.set(songId, lyrics, Math.min(1000 * 60 * 60 * 2, getLyricsCacheTtlSeconds(lyrics) * 1000));
+      await putSharedCache(env, cacheKey, lyrics, getLyricsCacheTtlSeconds(lyrics));
+      return lyrics;
     }
   }
 
