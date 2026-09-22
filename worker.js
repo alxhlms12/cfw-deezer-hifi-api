@@ -17,6 +17,15 @@ const API_VERSION = "1.5.3";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
+function makeRequestId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  globalThis.crypto?.getRandomValues?.(bytes);
+  let out = "";
+  for (const byte of bytes) out += byte.toString(16).padStart(2, "0");
+  return out || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 
 
 
@@ -4351,12 +4360,17 @@ const worker = {
     if (primaryRoute === "_root-tab-icon" && requestUrl.search === "") return rootAssetResponse(env, "tab");
 
     if (!primaryRoute && requestUrl.search === "") {
-      const html = buildRootHtml(env);
-      const headers = { ...getCorsHeaders(env), "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=30", "X-Request-ID": requestId };
-      return request.method === "HEAD" ? new Response(null, { status: 200, headers }) : new Response(html, { status: 200, headers });
+      try {
+        const html = buildRootHtml(env || {});
+        const headers = { ...getCorsHeaders(env || {}), "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=30", "X-Request-ID": requestId };
+        return request.method === "HEAD" ? new Response(null, { status: 200, headers }) : new Response(html, { status: 200, headers });
+      } catch (_) {
+        const headers = { ...getCorsHeaders(env || {}), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Request-ID": requestId };
+        return new Response(JSON.stringify({ version: API_VERSION, github: GITHUB_REPOSITORY_URL, for_public_use: envBoolean(env || {}, "PUBLIC_API", false) }), { status: 200, headers });
+      }
     }
 
-    if (request.method === "HEAD" && !["stream", "info", "search", "track", "album", "artist", "playlist", "chart", "genre", "radio", "cover", "ping", "arl-health", "device", "routing", "docs", "config"].includes((requestUrl.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || ""))) {
+    if (request.method === "HEAD" && !["stream", "info", "search", "album", "artist", "playlist", "chart", "genre", "radio", "cover", "ping", "arl-health", "device", "routing", "docs", "config"].includes((requestUrl.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || ""))) {
       return new Response(null, { status: 404, headers: { ...getCorsHeaders(env), "X-Request-ID": requestId } });
     }
 
@@ -4410,7 +4424,7 @@ const worker = {
       return jsonResponse({ version: API_VERSION, enabled: true, device_token: credential, device_id: deviceCheck.id, expires_at: deviceCheck.payload?.exp || null, header: "X-Voria-Device", cookie: DEVICE_CREDENTIAL_COOKIE, usage: "Store the device_token securely for native clients, or rely on the HttpOnly device cookie set by this response. Generated streamUrl values never contain the long-lived d1 device credential." }, 200, { "Cache-Control": "no-store", "X-Request-ID": requestId, "Set-Cookie": deviceCookie }, env);
     }
 
-    if (isMaintenanceMode(env) && primaryRoute !== "env") {
+    if (isMaintenanceMode(env)) {
       return jsonResponse({
         error: "MAINTENANCE_MODE",
         status: 503,
@@ -4705,62 +4719,6 @@ const worker = {
 
 
 
-
-    if (primaryRoute === "track" && segments[1] && /^\d+$/.test(segments[1]) && segments[2] === "stream") {
-      if (deviceBoundStreamsEnabled(env) && !deviceBinding.valid) return publicError(deviceBinding.present ? "DEVICE_CREDENTIAL_INVALID" : "DEVICE_CREDENTIAL_REQUIRED", 401, env, requestId);
-      const requestedTrackId = segments[1];
-      const streamToken = requestUrl.searchParams.get("stream_token") || (String(requestUrl.searchParams.get("device") || "").startsWith("d1.") ? null : requestUrl.searchParams.get("device"));
-      if (authenticatedPlaybackRequiresBootstrap(env, authToken) && !streamToken) {
-        return publicError("STREAM_TOKEN_REQUIRED", 401, env, requestId);
-      }
-      if (streamToken) {
-        const tokenCheck = await verifyStreamBootstrapToken(streamToken, { trackId: requestedTrackId, apiKey: authToken, clientIp, userAgentHash: shouldBindStreamTokenToUserAgent(env) ? clientUserAgentHash : null, deviceBindingHash }, env);
-        if (!tokenCheck.valid) return invalidStreamBootstrapToken(tokenCheck.reason, tokenCheck.reason === "expired" ? 401 : 403, env, requestId);
-      }
-      const rawQuality = (requestUrl.searchParams.get("quality") || requestUrl.searchParams.get("format") || env?.DEFAULT_QUALITY || "best").toLowerCase().trim();
-      try {
-        const resolved = await resolvePlaybackStreamOnly(requestedTrackId, rawQuality, env, auth.allowedSlots);
-        const resolvedTrackId = resolved.trackId || requestedTrackId;
-        if (String(resolvedTrackId) !== String(requestedTrackId)) {
-          return publicError("STREAM_TRACK_MISMATCH", 403, env, requestId);
-        }
-        let streamUrl = appendAuthenticatedStreamCredentials(
-          `${requestUrl.origin}/stream?id=${resolvedTrackId}&url=${encodeURIComponent(resolved.mediaResult.directCdnUrl)}&format=${encodeURIComponent(resolved.mediaResult.format)}`,
-          authToken,
-          deviceCredential,
-          env,
-        );
-        let sessionCookie = null;
-        if (authToken) {
-          sessionCookie = await establishStreamSession(resolvedTrackId, authToken, clientIp, env, clientUserAgentHash, deviceBindingHash);
-        }
-        if (sessionCookie) {
-          const stripped = new URL(streamUrl);
-          stripped.searchParams.delete("stream_token");
-          streamUrl = stripped.toString();
-        } else {
-          streamUrl = await appendStreamTokenToUrl(streamUrl, authToken, clientIp, env, clientUserAgentHash);
-        }
-        const headers = { Location: streamUrl, "Cache-Control": "no-store", "X-Request-ID": requestId };
-        if (sessionCookie) headers["Set-Cookie"] = sessionCookie;
-        return new Response(null, { status: 302, headers });
-      } catch (error) {
-        return publicError("STREAM_RESOLUTION_FAILED", 502, env, requestId);
-      }
-    }
-
-    if (primaryRoute === "track" && segments[1] && /^\d+$/.test(segments[1]) && segments[2] === "lyrics") {
-      if (envBoolean(env, "DISABLE_LYRICS", false)) return apiErrorResponse("Lyrics are disabled on this instance", 404, { endpoint: "/track/:id/lyrics" }, env);
-      try {
-        const pools = await getCandidatePools(env, auth.allowedSlots);
-        const session = pickAuxiliarySession(pools, env) || pools.lossless[0]?.session || pools.lossy[0]?.session;
-        const lyrics = await getDeezerLyrics(session, segments[1], env);
-        if (!lyrics) return apiErrorResponse("Lyrics not found", 404, null, env);
-        return catalogResponseForRequest({ version: API_VERSION, track_id: segments[1], data: lyrics }, 200, 0, env, apiToken, clientIp, clientUserAgentHash);
-      } catch (error) {
-        return publicError("LYRICS_REQUEST_FAILED", 502, env, requestId);
-      }
-    }
 
     if (!paramId && !paramIsrc && !paramTitle && !paramArtist && !paramQuery) {
       if (primaryRoute === "track") return apiErrorResponse("Missing track identifier", 400, null, env);
