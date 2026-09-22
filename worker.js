@@ -1,4 +1,4 @@
-// cfw-deezer-hifi-api-v1.5.2-alpha
+// cfw-deezer-hifi-api-v1.5.0
 // Public /ping authentication exception added on top of the v1.4.28 routing/racing pass.
 // Playback fix: /stream Range requests bypass the generic API rate limiter so continuous audio cannot be interrupted by 429 responses.
 // Playback hardening: authenticated playback entry points require signed
@@ -13,7 +13,7 @@ const DEEZER_PIPE_GQL = "https://pipe.deezer.com/api";
 const DEEZER_AUTH_ARL = "https://auth.deezer.com/login/arl?jo=p&rto=c&i=c";
 const DEEZER_AUTH_RENEW = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c";
 const PUBLIC_API_BASE = "https://api.deezer.com";
-const API_VERSION = "1.5.2-alpha";
+const API_VERSION = "1.5.3";
 const GITHUB_REPOSITORY_URL = "https://github.com/alxhlms12/cfw-deezer-hifi-api/";
 const SERVICE_NAME = "cfw-deezer-hifi-api";
 
@@ -21,7 +21,7 @@ const SERVICE_NAME = "cfw-deezer-hifi-api";
 
 
 
-const SAFE_DEFAULT_CHUNK = 512 * 1024;
+const SAFE_DEFAULT_CHUNK = 128 * 1024;
 const SAFE_MIN_CHUNK = 64 * 1024;
 const SAFE_MAX_CHUNK_HARD = 1024 * 1024;
 
@@ -31,7 +31,7 @@ function getCorsHeaders(env) {
     "Access-Control-Allow-Origin": origin,
     "Vary": "Origin",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, X-Chunk-Size, X-API-Key, X-Request-ID, X-Voria-Device",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Range, X-API-Key, X-Request-ID, X-Voria-Device",
     "Access-Control-Expose-Headers": "Content-Length, Content-Type, Accept-Ranges, Content-Range, Server-Timing, X-Timing-Fetch-Ms, X-Timing-Process-Ms, X-Timing-Total-Ms, X-CPU-Safety, X-ARL-Slot, X-ARL-Tier, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset-Ms",
   };
 }
@@ -661,11 +661,7 @@ function pickBestTrack(tracks, queryInfo, allowAlt = false, preferExplicit = tru
       return titleMatches && artistMatches;
     });
 
-    if (relevant.length > 0) {
-      candidates = relevant;
-    } else {
-      return null;
-    }
+    if (relevant.length > 0) candidates = relevant;
   }
 
   if (preferExplicit) {
@@ -974,13 +970,16 @@ function getSafeChunkSize(requestUrl, env) {
   if (!param) return Math.min(SAFE_DEFAULT_CHUNK, maxChunk);
   const clean = String(param).toLowerCase().trim();
 
-  if (clean === "256k" || clean === "256kb") return Math.min(256 * 1024, maxChunk);
-  if (clean === "512k" || clean === "512kb") return Math.min(512 * 1024, maxChunk);
-
-  const parsed = parseInt(clean, 10);
-  if (Number.isFinite(parsed) && parsed > 0) {
-    const clamped = Math.max(SAFE_MIN_CHUNK, Math.min(maxChunk, parsed));
-    return Math.floor(clamped / 2048) * 2048;
+  const sizeMatch = clean.match(/^(\d+(?:\.\d+)?)\s*(b|kb|kib|mb|mib)?$/i);
+  if (sizeMatch) {
+    const amount = Number(sizeMatch[1]);
+    const unit = String(sizeMatch[2] || "b").toLowerCase();
+    const multiplier = unit === "mb" || unit === "mib" ? 1024 * 1024 : (unit === "kb" || unit === "kib" ? 1024 : 1);
+    const parsed = amount * multiplier;
+    if (Number.isFinite(parsed) && parsed > 0) {
+      const clamped = Math.max(SAFE_MIN_CHUNK, Math.min(maxChunk, Math.floor(parsed)));
+      return Math.floor(clamped / 2048) * 2048;
+    }
   }
 
   return Math.min(SAFE_DEFAULT_CHUNK, maxChunk);
@@ -2306,7 +2305,7 @@ async function discoverTrack({ id, isrc, query, title, artist }, env = null, all
       return kvSearch;
     }
 
-    const resp = await fetchWithTimeout(`https://api.deezer.com/search?q=${encodeURIComponent(queryInfo.clean)}&limit=25`, {
+    const resp = await fetchWithTimeout(`https://api.deezer.com/search?q=${encodeURIComponent(queryInfo.clean)}&limit=10`, {
       headers: { "User-Agent": BROWSER_HEADERS["User-Agent"] },
     }, env);
     const result = await readResponseLimited(resp);
@@ -3746,249 +3745,6 @@ async function handleCatalogRoute(requestUrl, env, segments, apiToken = null, cl
 }
 
 
-function getTestRoutingPresentedKey(requestUrl) {
-  const direct = requestUrl.searchParams.get("api_key")?.trim() || requestUrl.searchParams.get("key")?.trim();
-  if (direct) return direct;
-  const pathMatch = requestUrl.pathname.match(/^\/test(?:-routing|Routing|Routings)&api_key=(.+)$/i);
-  return pathMatch ? decodeURIComponent(pathMatch[1]).trim() : "";
-}
-
-function isTestRoutingsPath(requestUrl) {
-  const path = requestUrl.pathname.replace(/\/+$/, "") || "/";
-  return /^\/test(?:-routing|Routing|Routings)(?:\/run)?$/i.test(path) || /^\/test(?:-routing|Routing|Routings)&api_key=.+$/i.test(path);
-}
-
-function authenticateTestRoutings(requestUrl, env) {
-  const { mappings } = getMemoizedConfig(env);
-  const publicApi = String(env?.PUBLIC_API ?? "false").toLowerCase() === "true";
-  const token = getTestRoutingPresentedKey(requestUrl);
-  if (publicApi && mappings.size === 0) return { authorized: true, tokenId: token || "public", allowedSlots: null };
-  if (!token || !mappings.has(token)) return { authorized: false, tokenId: null, allowedSlots: null };
-  return { authorized: true, tokenId: token, allowedSlots: mappings.get(token) };
-}
-
-function testRoutingErrorDetails(error, fallbackStatus = 502) {
-  const status = Number(error?.status || error?.errorNumber || fallbackStatus);
-  const upstreamCode = error?.upstreamCode || error?.code || null;
-  const message = error?.upstreamMessage || error?.message || String(error || "Unknown error");
-  return {
-    errorNumber: Number.isFinite(status) && status > 0 ? status : fallbackStatus,
-    errorCode: upstreamCode,
-    errorText: String(message).slice(0, 1000),
-  };
-}
-
-function makeTestRoutingLine(text = "") {
-  return `${new Date().toISOString()}  ${String(text)}\n`;
-}
-
-function buildTestRoutingsHtml(requestUrl, env, apiKey) {
-  const safeVersion = String(API_VERSION).replace(/[^0-9A-Za-z._-]/g, "");
-  const origin = requestUrl.origin;
-  const encodedKey = btoa(unescape(encodeURIComponent(String(apiKey || ""))));
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Worker Routing Diagnostics</title><style>
-:root{color-scheme:dark;--bg:#07090d;--panel:#0b0f15;--line:#202936;--muted:#778397;--text:#e8edf5;--ok:#78e6a0;--bad:#ff7e8b;--key:#8bd5ff}*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text)}body{font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}main{width:min(100%,1050px);margin:0 auto;padding:18px}.json{border:1px solid var(--line);background:var(--panel);border-radius:12px;overflow:hidden}.bar{display:flex;justify-content:space-between;padding:12px 15px;border-bottom:1px solid var(--line)}.title{font-weight:700}.version{color:var(--muted);font-size:12px}.body{padding:16px}.key{color:var(--key)}.brace{color:#aeb8c8;font-weight:700}.field{padding-left:22px}.terminal{height:68vh;min-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:13px 14px;margin:12px 0;border:1px solid #1e2733;border-radius:8px;background:#06080c}.line{min-height:1.55em}.ok{color:var(--ok)}.fail{color:var(--bad)}.dim{color:var(--muted)}@media(max-width:600px){main{padding:8px}.body{padding:11px}.terminal{height:72vh;min-height:300px}}
-</style></head><body><main><section class="json"><div class="bar"><span class="title">cfw-deezer-hifi-api /test-routing</span><span class="version">v${safeVersion}</span></div><div class="body"><div class="brace">{</div><div class="field"><span class="key">"diagnostics"</span>: {</div><div class="field"><span class="key">"interactive"</span>: true,</div><div class="field"><span class="key">"description"</span>: "Routing-only end-to-end diagnostic",</div><div class="field"><span class="key">"arl_health"</span>: "separate at /arl-health"</div><div class="field">}</div><div class="brace">,</div><div id="terminal" class="terminal"></div><div id="done">"status": "starting"</div><div class="brace">}</div></div></section></main><script>
-const origin=${JSON.stringify(origin)},key=decodeURIComponent(escape(atob(${JSON.stringify(encodedKey)}))),trackId=new URL(location.href).searchParams.get('track_id')||'920991742',terminal=document.getElementById('terminal'),done=document.getElementById('done');const append=(x,c='')=>{const d=document.createElement('div');d.className='line '+c;d.textContent=x;terminal.appendChild(d);terminal.scrollTop=terminal.scrollHeight};const cls=x=>x.includes('FAIL')?'fail':x.includes('PASS')?'ok':x.includes('SKIP')?'dim':'';(async()=>{append('cfw-deezer-hifi-api routing diagnostics starting...','dim');append('Track ID: '+trackId,'dim');append('Routing/catalog/playback tests only. ARL health: /arl-health','dim');const u=new URL(origin+'/test-routing/run');u.searchParams.set('phase','routes');u.searchParams.set('api_key',key);u.searchParams.set('track_id',trackId);try{const r=await fetch(u,{cache:'no-store'});if(!r.ok){append('HTTP '+r.status,'fail');done.textContent='"status": "failed"';return}const rd=r.body?.getReader();if(!rd){append('Diagnostic stream unavailable','fail');done.textContent='"status": "failed"';return}const dec=new TextDecoder();let b='';while(true){const {value,done:d}=await rd.read();if(d)break;b+=dec.decode(value,{stream:true});const a=b.split('\n');b=a.pop()||'';for(const line of a){if(!line)continue;if(line==='@@DONE@@'){done.textContent='"status": "complete"';return}append(line,cls(line))}}if(b)append(b,cls(b));done.textContent='"status": "complete"'}catch(e){append('CLIENT_ERROR: '+(e?.message||String(e)),'fail');done.textContent='"status": "failed"'}})();</script></body></html>`;
-}
-async function streamTestRoutingsResponse(request, env, requestUrl, phase, trackId, apiKey, allowedSlots) {
-  const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
-      const write = (text) => controller.enqueue(encoder.encode(makeTestRoutingLine(text)));
-      const writeRaw = (text) => controller.enqueue(encoder.encode(`${text}\n`));
-      try {
-        write(`=== cfw-deezer-hifi-api ${API_VERSION} routing diagnostics ===`);
-        write(`Phase: routes`);
-        if (!/^\d+$/.test(String(trackId || ""))) throw Object.assign(new Error("A numeric Deezer Track ID is required"), { status: 400, code: "INVALID_TRACK_ID" });
-        write(`Track ID: ${trackId}`);
-        write("Testing routing/catalog/playback paths only. ARL health is handled separately by /arl-health.");
-        const base = new URL("https://diagnostic.invalid");
-        const tests = [
-          ["/", async()=>({status:200, value:buildRootStatus(env)})],
-          ["/info-api", async()=>({status:200, value:{ok:true}})],
-          ["/routing", async()=>({status:200, value:routingInfo(env)})],
-          ["/docs", async()=>({status:200, value:buildDocs(base, env)})],
-          ["/recommendations?q="+encodeURIComponent(searchText), async()=>handleCatalogRoute(new URL(`/recommendations?q=${encodeURIComponent(searchText)}`, base), env, ["recommendations"], apiKey, "diagnostic", null)],
-          ["/recommendations?isrc="+(seed?.isrc || seed?.ISRC || "n/a"), async()=>{
-            const seedIsrc=String(seed?.isrc || seed?.ISRC || "").trim();
-            if (!seedIsrc) return {status:204, value:{skipped:"seed has no ISRC"}};
-            return handleCatalogRoute(new URL(`/recommendations?isrc=${encodeURIComponent(seedIsrc)}`, base), env, ["recommendations"], apiKey, "diagnostic", null);
-          }],
-          ["/info?id="+trackId, async()=>handleCatalogRoute(new URL(`/info?id=${trackId}`, base), env, ["info"], apiKey, "diagnostic", null)],
-          ["/search?q="+encodeURIComponent(searchText), async()=>handleCatalogRoute(new URL(`/search?q=${encodeURIComponent(searchText)}`, base), env, ["search"], apiKey, "diagnostic", null)],
-          ["/track?id="+trackId, async()=>{const t=await discoverTrack({id:String(trackId)},env,true,true);if(!t?.id)throw Object.assign(new Error("Track metadata could not be resolved"),{status:404,code:"TRACK_NOT_FOUND"});const r=await resolvePlaybackStreamOnly(String(trackId),"best",env,allowedSlots);return {status:200,value:{id:t.id,format:r.mediaResult?.format}};}],
-          ["/playlist?id="+trackId, async()=>handleCatalogRoute(new URL(`/playlist?id=${trackId}`, base), env, ["playlist"], apiKey, "diagnostic", null)],
-          ["/radio?id="+trackId, async()=>handleCatalogRoute(new URL(`/radio?id=${trackId}`, base), env, ["radio"], apiKey, "diagnostic", null)],
-          ["/recommendations?id="+trackId, async()=>handleCatalogRoute(new URL(`/recommendations?id=${trackId}`, base), env, ["recommendations"], apiKey, "diagnostic", null)],
-          ["/cover?id="+trackId, async()=>handleCatalogRoute(new URL(`/cover?id=${trackId}`, base), env, ["cover"], apiKey, "diagnostic", null)],
-          ["/lyrics?id="+trackId, async()=>{const pools=await getCandidatePools(env, allowedSlots);const session=pickAuxiliarySession(pools,env)||pools.lossless[0]?.session||pools.lossy[0]?.session;if(!session) throw Object.assign(new Error("No session for lyrics"),{status:503,code:"LYRICS_SESSION_UNAVAILABLE"});const lyrics=await getDeezerLyrics(session,String(trackId),env);if(!lyrics) return {status:204,value:{skipped:"lyrics not available for diagnostic track",code:"LYRICS_NOT_FOUND"}};return {status:200,value:{hasWordSync:Boolean(lyrics.hasWordSync)}};}],
-          ["/chart?type=tracks", async()=>handleCatalogRoute(new URL("/chart?type=tracks", base), env, ["chart"], apiKey, "diagnostic", null)],
-          ["/genre?id=132", async()=>handleCatalogRoute(new URL("/genre?id=132", base), env, ["genre"], apiKey, "diagnostic", null)],
-          ["/genre", async()=>handleCatalogRoute(new URL("/genre", base), env, ["genre"], apiKey, "diagnostic", null)],
-        ];
-        if (deviceBoundStreamsEnabled(env)) {
-          tests.push(["/device", async()=>{
-            const credential=await registerDeviceCredential(apiKey, env);
-            if (!credential) throw Object.assign(new Error("Device signing is enabled but no credential could be registered"),{status:503,code:"DEVICE_SIGNING_NOT_CONFIGURED"});
-            const verified=await verifyDeviceCredential(credential, apiKey, env);
-            if (!verified?.valid || !verified?.id) throw Object.assign(new Error("Generated device credential failed verification"),{status:500,code:"DEVICE_CREDENTIAL_SELF_TEST_FAILED"});
-            return {status:200,value:{enabled:true,valid:true,device_id:verified.id,expires_at:verified.payload?.exp||null}};
-          }]);
-        } else {
-          write("SKIP  /device  DEVICE_BOUND_SIGNED_STREAMS=false");
-        }
-
-        if (albumId) {
-          tests.push([`/album?id=${albumId}`, async()=>handleCatalogRoute(new URL(`/album?id=${albumId}`, base), env, ["album"], apiKey, "diagnostic", null)]);
-          tests.push([`/album/${albumId}/tracks`, async()=>handleCatalogRoute(new URL(`/album/${albumId}/tracks`, base), env, ["album",String(albumId),"tracks"], apiKey, "diagnostic", null)]);
-        } else {
-          write("/album: SKIP (seed did not expose an album id)");
-        }
-        if (artistId) {
-          tests.push([`/artist?id=${artistId}`, async()=>handleCatalogRoute(new URL(`/artist?id=${artistId}`, base), env, ["artist"], apiKey, "diagnostic", null)]);
-          tests.push([`/artist/${artistId}/top`, async()=>handleCatalogRoute(new URL(`/artist/${artistId}/top`, base), env, ["artist",String(artistId),"top"], apiKey, "diagnostic", null)]);
-          tests.push([`/artist/${artistId}/albums`, async()=>handleCatalogRoute(new URL(`/artist/${artistId}/albums`, base), env, ["artist",String(artistId),"albums"], apiKey, "diagnostic", null)]);
-        } else {
-          write("/artist: SKIP (seed did not expose an artist id)");
-        }
-
-        let playback = null;
-        for (const [label, fn] of tests) {
-          const started = Date.now();
-          try {
-            const result = await fn();
-            const status = result?.status || 200;
-            if (status >= 400) {
-              let body = null;
-              if (result instanceof Response) {
-                try { body = await result.clone().json(); } catch (_) {}
-              }
-              const d = { errorNumber: status, errorCode: body?.code || body?.error || null, errorText: body?.message || body?.errorText || body?.details?.message || `HTTP ${status}` };
-              write(`FAIL  ${label}  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}  ${Date.now()-started}ms`);
-            } else if (status === 204 || result?.value?.skipped) {
-              write(`SKIP  ${label}  ${result?.value?.skipped || "diagnostic skipped"}  ${Date.now()-started}ms`);
-            } else {
-              write(`PASS  ${label}  ${Date.now()-started}ms`);
-            }
-          } catch (err) {
-            const d = testRoutingErrorDetails(err, 502);
-            write(`FAIL  ${label}  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}  ${Date.now()-started}ms`);
-          }
-        }
-
-        const playbackStarted = Date.now();
-        try {
-          playback = await resolvePlaybackStreamOnly(String(trackId), "best", env, allowedSlots);
-          write(`PASS  /stream-track?id=${trackId}  resolved ${playback.selectedProfile?.label || playback.mediaResult?.format || "media"} via ARL slot ${playback.slot}  ${Date.now()-playbackStarted}ms`);
-          write(`PASS  /track/${trackId}/stream  playback resolver verified  ${Date.now()-playbackStarted}ms`);
-          write(`PASS  /stream  CDN media source verified; full decrypt is intentionally not consumed by diagnostics to avoid downloading audio.`);
-        } catch (err) {
-          const d = testRoutingErrorDetails(err, 502);
-          write(`FAIL  /stream-track?id=${trackId}  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`);
-          write(`FAIL  /track/${trackId}/stream  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`);
-          write(`FAIL  /stream  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`);
-        }
-
-        const adminKey = String(env?.ADMIN_API_KEY || "").trim();
-        if (adminKey && apiKey === adminKey) {
-          write("PASS  /env  admin key supplied by test API key");
-        } else {
-          write("SKIP  /env  requires ADMIN_API_KEY; the diagnostic only has the client API key");
-        }
-        write(`Diagnostic contract: /test-routing is canonical; /testRouting and /testRoutings remain compatibility aliases.`);
-        write(`=== ROUTING TEST COMPLETE ===`);
-        writeRaw("@@DONE@@");
-      } catch (error) {
-        const d = testRoutingErrorDetails(error, 502);
-        write(`FATAL FAIL  [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`);
-        writeRaw("@@DONE@@");
-      } finally {
-        controller.close();
-      }
-    }
-  });
-  return new Response(stream, { status: 200, headers: { ...getCorsHeaders(env), "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store", "X-Accel-Buffering": "no" } });
-}
-
-async function runTestRoutingsJson(request, env, requestUrl, trackId, apiKey, allowedSlots) {
-  const phases = [];
-  const run = async (phase) => {
-    const phaseResponse = await streamTestRoutingsResponse(request, env, requestUrl, phase, trackId, apiKey, allowedSlots);
-    const raw = await phaseResponse.text();
-    const lines = raw.split(/\r?\n/).filter(Boolean);
-    const output = [];
-    let status = "complete";
-    let sawFatal = false;
-    let sawArlFailure = false;
-    for (const line of lines) {
-      const match = line.match(/^\d{4}-\d{2}-\d{2}T[^ ]+\s{2}(.*)$/);
-      const text = match ? match[1] : line;
-      if (text === "@@CONTINUE@@" || text === "@@DONE@@") continue;
-      if (/FATAL FAIL/.test(text)) sawFatal = true;
-      if (/^\s*RESULT:\s+FAILED\b/.test(text)) sawArlFailure = true;
-      if (phase !== "arls" && /\bFAIL\b/.test(text)) sawFatal = true;
-      output.push(text);
-    }
-    if (sawFatal || sawArlFailure) status = "failed";
-    phases.push({ phase, status, output });
-    return status === "complete";
-  };
-
-  const startedAt = new Date().toISOString();
-  let overallStatus = "complete";
-  try {
-    if (!/^\d+$/.test(String(trackId || ""))) {
-      return {
-        diagnostics: "test-routing",
-        version: API_VERSION,
-        status: "failed",
-        track_id: String(trackId || ""),
-        started_at: startedAt,
-        errorNumber: 400,
-        errorCode: "INVALID_TRACK_ID",
-        errorText: "A numeric Deezer Track ID is required",
-        phases: []
-      };
-    }
-    const routesOk = await run("routes");
-    if (!routesOk) overallStatus = "failed";
-  } catch (error) {
-    const d = testRoutingErrorDetails(error, 502);
-    overallStatus = "failed";
-    phases.push({ phase: "fatal", status: "failed", output: [`FATAL FAIL [${d.errorNumber}] ${d.errorText}${d.errorCode ? ` (${d.errorCode})` : ""}`], error: d });
-  }
-
-  const routePhase = phases.find(x => x.phase === "routes");
-  const routeOutput = routePhase?.output || [];
-  const passCount = routeOutput.filter(x => /^PASS\s/.test(x)).length;
-  const failCount = routeOutput.filter(x => /\bFAIL\b/.test(x)).length;
-  const skipCount = routeOutput.filter(x => /^SKIP\s/.test(x)).length;
-
-  return {
-    diagnostics: "test-routing",
-    version: API_VERSION,
-    status: overallStatus,
-    track_id: String(trackId),
-    started_at: startedAt,
-    completed_at: new Date().toISOString(),
-    phases,
-    summary: {
-      arls_tested: 0,
-      routes_passed: passCount,
-      routes_failed: failCount,
-      routes_skipped: skipCount,
-      routes_tested: passCount + failCount + skipCount
-    }
-  };
-}
-
-function makeRequestId() {
-  return crypto.randomUUID ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
-}
-function safeRouteName(pathname) {
-  return pathname.split("/").filter(Boolean).slice(0, 3).join("/") || "/";
-}
 function getPresentedApiToken(request, env) {
   const allowQueryKey = String(env?.ALLOW_QUERY_API_KEY || "false").toLowerCase() === "true";
   const url = new URL(request.url);
@@ -4008,7 +3764,6 @@ const ENVIRONMENT_VARIABLES = {
   PUBLIC_API: "Set true to disable API-key authentication for requests.",
   REQUIRE_API_KEY: "Set false to make API keys optional when API_KEY slots are configured.",
   ALLOW_QUERY_API_KEY: "Set true to accept api_key or key in the query string; Authorization/X-API-Key are always supported.",
-  ADMIN_API_KEY: "Required for the /env diagnostics route.",
   DEEZER_ARL: "Primary Deezer ARL credential; equivalent to DEEZER_ARL_1.",
   DEEZER_ARL_1: "Primary Deezer ARL credential when DEEZER_ARL is not set.",
   DEEZER_ARL_2_50: "Additional Deezer ARL credentials. Each slot is independently tested and load-balanced.",
@@ -4028,9 +3783,9 @@ const ENVIRONMENT_VARIABLES = {
   TRACK_TOKEN_INFLIGHT_TTL_MS: "How long identical concurrent track-token requests are coalesced; defaults to 5000 ms and is clamped to 1000-30000 ms.",
   UPSTREAM_TIMEOUT_MS: "Timeout for catalog/auth/lyrics upstream requests; clamped to 1000-20000 ms.",
   STREAM_CDN_HOSTS: "Semicolon-separated HTTPS CDN host allowlist for /stream.",
-  STREAM_CHUNK_SIZE: "Default decrypted audio chunk size; clamped to the configured maximum.",
-  STREAM_MAX_CHUNK_SIZE_BYTES: "Hard per-request decrypted chunk ceiling; defaults to 512 KiB and is clamped to 64 KiB-1 MiB. Larger values can improve throughput but increase CPU/memory pressure.",
-  CHUNK_SIZE: "Fallback chunk-size setting when STREAM_CHUNK_SIZE is not set; still capped by STREAM_MAX_CHUNK_SIZE_BYTES.",
+  STREAM_CHUNK_SIZE: "Default decrypted audio chunk size; defaults to 128 KiB and is clamped to the configured maximum.",
+  STREAM_MAX_CHUNK_SIZE_BYTES: "Hard per-request decrypted chunk ceiling; defaults to 1 MiB and is clamped to 64 KiB-1 MiB. The normal worker chunk default is 128 KiB.",
+  CHUNK_SIZE: "Fallback chunk-size setting when STREAM_CHUNK_SIZE is not set; defaults to 128 KiB and remains capped by STREAM_MAX_CHUNK_SIZE_BYTES.",
   STREAM_CACHE_CONTROL: "Cache-Control header emitted by /stream; defaults to private, no-store.",
   STREAM_TOKEN_SECRET: "Secret used to sign temporary playback tokens; set independently in production.",
   STREAM_TOKEN_TTL_SECONDS: "Lifetime of the temporary bootstrap stream token; defaults to 600 seconds and is clamped to 30-3600.",
@@ -4054,7 +3809,7 @@ const ENVIRONMENT_VARIABLES = {
   TITLE: "Optional browser document title for the root status page; defaults to cfw-deezer-hifi-api.",
   IMG: "Optional HTTP(S) image URL displayed in the expanded root img dictionary. The Worker proxies it through /_root-img.",
   IMG_TB: "Optional HTTP(S) image URL used as the browser tab icon through /_root-tab-icon.",
-  MAINTENANCE_MODE: "Set true to temporarily reject normal API/playback traffic with HTTP 503 while leaving the root status, /docs, and /env diagnostics available.",
+  MAINTENANCE_MODE: "Set true to temporarily reject normal API/playback traffic with HTTP 503 while leaving the root status and /docs available.",
   MAINTENANCE_MESSAGE: "Optional public maintenance message returned when MAINTENANCE_MODE=true. Defaults to Service temporarily unavailable for maintenance.",
   DISABLE_RECOMMENDATIONS: "Set true to disable /recommendations without disabling the rest of the catalog API.",
   DISABLE_LYRICS: "Set true to disable standalone lyrics routes and embedded lyrics resolution. This can reduce auxiliary Deezer requests and ARL usage.",
@@ -4067,7 +3822,7 @@ const CONFIG_DEFINITIONS = [
   { name: "DEEZER_ARL_1", example: "{arl_here}", required: false, secret: true, score: 10, description: "Explicit alias for the primary Deezer ARL slot. Use DEEZER_ARL for the simpler configuration form." },
   { name: "API_KEY_1..50", example: "{client_key_here}", required: false, secret: true, score: 7, description: "Numbered client API-key slots. API_KEY is the primary alias for slot 1." },
   { name: "KEY / KEY_1..50", example: "1,2,3", required: false, secret: false, score: 7, description: "Restricts each client API key to specific Deezer ARL slots. Useful when different clients should use different accounts." },
-  { name: "ADMIN_API_KEY", example: "{admin_key_here}", required: false, secret: true, score: 8, description: "Protects administrative environment diagnostics. Keep this separate from normal client API keys." },
+  { name: "ADMIN_API_KEY", example: "{admin_key_here}", required: false, secret: true, score: 8, description: "Optional signing-secret fallback used by the stream-token security path. It is no longer used for an environment-diagnostics endpoint." },
   { name: "PUBLIC_API", example: "false", required: false, secret: false, score: 3, description: "Intentionally disables normal API-key authentication. Only use when the endpoint is deliberately public." },
   { name: "REQUIRE_API_KEY", example: "true", required: false, secret: false, score: 8, description: "Controls whether normal requests require a client API key when no public mode is enabled." },
   { name: "ALLOW_QUERY_API_KEY", example: "false", required: false, secret: false, score: 4, description: "Allows API keys in query strings for clients that cannot send headers. Disabled by default because URLs are easier to leak through logs and history." },
@@ -4083,9 +3838,9 @@ const CONFIG_DEFINITIONS = [
   { name: "TRACK_TOKEN_INFLIGHT_TTL_MS", example: "5000", required: false, secret: false, score: 8, description: "Coalesces identical concurrent track-token requests to reduce upstream and CPU load." },
   { name: "UPSTREAM_TIMEOUT_MS", example: "8000", required: false, secret: false, score: 8, description: "Bounds upstream requests so a slow Deezer response cannot hold a Worker request indefinitely." },
   { name: "STREAM_CDN_HOSTS", example: "*.dzcdn.net;media.deezer.com", required: false, secret: false, score: 9, description: "Allowlist of HTTPS media hosts accepted by /stream. This prevents the stream endpoint from becoming an arbitrary URL proxy." },
-  { name: "CHUNK_SIZE", example: "512k", required: false, secret: false, score: 5, description: "Legacy fallback chunk-size setting used when STREAM_CHUNK_SIZE is not set." },
-  { name: "STREAM_CHUNK_SIZE", example: "512k", required: false, secret: false, score: 6, description: "Default decrypted audio chunk size. Larger chunks can improve throughput but increase CPU and memory pressure." },
-  { name: "STREAM_MAX_CHUNK_SIZE_BYTES", example: "524288", required: false, secret: false, score: 8, description: "Hard ceiling for one decrypted audio chunk, limiting per-request resource usage." },
+  { name: "CHUNK_SIZE", example: "128k", required: false, secret: false, score: 5, description: "Legacy fallback chunk-size setting used when STREAM_CHUNK_SIZE is not set; defaults to 128 KiB." },
+  { name: "STREAM_CHUNK_SIZE", example: "128k", required: false, secret: false, score: 6, description: "Default decrypted audio chunk size is 128 KiB. Larger configured chunks can improve throughput but increase CPU and memory pressure." },
+  { name: "STREAM_MAX_CHUNK_SIZE_BYTES", example: "524288", required: false, secret: false, score: 8, description: "Hard ceiling for one decrypted audio chunk, limiting per-request resource usage; normal default chunk size is 128 KiB." },
   { name: "STREAM_CACHE_CONTROL", example: "private, no-store", required: false, secret: false, score: 7, description: "Controls caching headers for decrypted stream responses." },
   { name: "STREAM_TOKEN_SECRET", example: "{secret_here}", required: false, secret: true, score: 10, description: "Independent signing secret for temporary playback authorization. Explicitly setting it prevents ARL or client-key changes from changing the playback signing key." },
   { name: "STREAM_TOKEN_TTL_SECONDS", example: "600", required: false, secret: false, score: 8, description: "Lifetime of temporary playback bootstrap tokens. Shorter values reduce the window for stolen tokens." },
@@ -4163,7 +3918,7 @@ function buildDocs(requestUrl, env) {
     ? {
         mode: "public",
         requests_require_client_api_key: false,
-        explanation: "PUBLIC_API=true makes normal API authentication bypassed. The /env diagnostics endpoint still requires ADMIN_API_KEY."
+        explanation: "PUBLIC_API=true makes normal API authentication bypassed. The retired /env diagnostics endpoint is not available."
       }
     : mappings.size > 0
       ? {
@@ -4192,7 +3947,7 @@ function buildDocs(requestUrl, env) {
     PUBLIC_API: { type: "boolean string", secret: false, default: "false", effect: "When true, bypasses normal client API-key authentication." },
     REQUIRE_API_KEY: { type: "boolean string", secret: false, default: "true", effect: "When false and no API_KEY slots exist, normal requests are open. If API_KEY slots exist, matching keys are still required." },
     ALLOW_QUERY_API_KEY: { type: "boolean string", secret: false, default: "false", effect: "When true, also accepts api_key or key in the query string. Header authentication always remains available." },
-    ADMIN_API_KEY: { type: "secret string", secret: true, required_for: ["/env"], default: "not set", effect: "Authorizes the protected /env diagnostics endpoint. It is never returned by /env." },
+    ADMIN_API_KEY: { type: "secret string", secret: true, default: "not set", effect: "Optional fallback secret for stream-token signing. It is not used to authorize an environment-diagnostics endpoint." },
     DEEZER_ARL: { type: "secret string", secret: true, default: "not set", effect: "Primary Deezer ARL. This is slot 1 when present." },
     DEEZER_ARL_1: { type: "secret string", secret: true, default: "not set", effect: "Alternate name for slot 1 when DEEZER_ARL is absent." },
     DEEZER_ARL_2_50: { type: "secret string range", secret: true, default: "not set", effect: "Additional Deezer ARL slots. The Worker scans slots 2 through 50 and can load-balance among configured accounts." },
@@ -4212,9 +3967,9 @@ function buildDocs(requestUrl, env) {
     TRACK_TOKEN_INFLIGHT_TTL_MS: { type: "number", secret: false, default: "5000", range: "1000-30000", effect: "TTL for coalescing identical concurrent Deezer track-token requests." },
     UPSTREAM_TIMEOUT_MS: { type: "number", secret: false, default: "8000", range: "1000-20000", effect: "Timeout for catalog, authentication, lyrics, and other bounded upstream requests." },
     STREAM_CDN_HOSTS: { type: "semicolon-separated host patterns", secret: false, default: "*.dzcdn.net;media.deezer.com", effect: "Allowlist for HTTPS upstream hosts accepted by /stream. Wildcards only work as leading *.host patterns." },
-    STREAM_CHUNK_SIZE: { type: "bytes or 256k/512k", secret: false, default: "worker safe default", range: "64 KiB-configured maximum", effect: "Default decrypted streaming chunk size." },
-    STREAM_MAX_CHUNK_SIZE_BYTES: { type: "number", secret: false, default: "524288", range: "65536-1048576", effect: "Hard ceiling for a single decrypted audio request. Raising it may improve throughput on fast clients while increasing per-request CPU and memory pressure." },
-    CHUNK_SIZE: { type: "bytes or 256k/512k", secret: false, default: "worker safe default", range: "64 KiB-configured maximum", effect: "Fallback chunk-size setting used only when STREAM_CHUNK_SIZE is not set." },
+    STREAM_CHUNK_SIZE: { type: "bytes or 128k/256k/512k", secret: false, default: "128 KiB", range: "64 KiB-configured maximum", effect: "Default decrypted streaming chunk size. Supports byte values and k/kb/kib/mb/mib suffixes." },
+    STREAM_MAX_CHUNK_SIZE_BYTES: { type: "number", secret: false, default: "1048576", range: "65536-1048576", effect: "Hard ceiling for a single decrypted audio request. The normal worker default chunk is 128 KiB." },
+    CHUNK_SIZE: { type: "bytes or 128k/256k/512k", secret: false, default: "128 KiB", range: "64 KiB-configured maximum", effect: "Fallback chunk-size setting used only when STREAM_CHUNK_SIZE is not set; supports byte values and k/kb/kib/mb/mib suffixes." },
     STREAM_TOKEN_SECRET: { type: "secret string", secret: true, default: "falls back to ADMIN_API_KEY or the primary Deezer ARL if unset", effect: "HMAC-SHA-256 signing secret for temporary client-bound playback tokens. Set this independently in production so changing client API keys or ARLs does not change the signing key." },
     STREAM_TOKEN_TTL_SECONDS: { type: "number", secret: false, default: "600", range: "30-3600", effect: "Lifetime of the generated stream_token. The token remains valid until expiration and is used to authorize the playback session." },
     STREAM_SESSION_TTL_SECONDS: { type: "number", secret: false, default: "1800", range: "60-7200", effect: "Idle playback-session lifetime. Active playback can continue beyond this through session refreshes; inactive/stolen session cookies eventually expire." },
@@ -4315,7 +4070,6 @@ function buildDocs(requestUrl, env) {
         "/ping": "Cheap public instance liveness check. It does not contact Deezer or validate ARLs. Use /arl-health for live ARL validation and per-slot capability checks.",
       "/arl-health": "Public detailed Worker and ARL health report. Includes ARL status/capabilities, bindings, configuration flags, and in-memory runtime counters. No ARL values or protected Deezer payloads are returned.",
         "/routing": "Public live routing, authentication, playback-security, timeout, route, and hardening configuration summary; no API key required.",
-        "/env": "Admin-only non-secret environment diagnostics. Secret-like names/values are filtered and never exposed.",
         "/docs": "Public machine-readable documentation generated from the current Worker origin and environment configuration.",
                 "/": "Credential-free instance identity/status response."
       }
@@ -4383,8 +4137,6 @@ function buildDocs(requestUrl, env) {
       similar_recommendations_isrc: `${origin}/recommendations?isrc=USUG11600920&limit=25`,
       device: `${origin}/device`,
       routing: `${origin}/routing`,
-      test_routing: `${origin}/test-routing?api_key=<configured-api-key>&track_id=920991742`,
-      test_routing_alias: `${origin}/test-routing?api_key=<configured-api-key>&track_id=920991742`,
       lyrics: `${origin}/lyrics?id=3135556`,
       playable_track: `${origin}/stream-track/?id=3135556`,
       track_stream_redirect: `${origin}/track/3135556/stream?quality=flac`,
@@ -4419,8 +4171,6 @@ function buildDocs(requestUrl, env) {
       "/ping": "Tests configured Deezer ARL slots and reports active/failed state and detected quality capability.",
       "/device": "Registers a cryptographically signed device credential when DEVICE_BOUND_SIGNED_STREAMS=true. Native clients should store device_token securely and send X-Voria-Device. Browsers can use the HttpOnly __Host-VoriaDevice cookie automatically set by /device. Refresh /device if the signing secret/credential is rotated or the browser no longer has a valid device cookie. If ALLOW_QUERY_DEVICE_SIGN=true, raw d1 credentials may be supplied as ?device_credential= for testing. Generated streamUrl values never contain the long-lived d1 credential.",
       "/routing": "Public, rate-limited routing/security diagnostics. No API key is required because it reports configuration shape and limits, not credential values. It reports device-bound signing state, playback URL authorization, diagnostic aliases, and supported HTTP methods.",
-      "/env": "Admin-only environment diagnostics. Values matching secret-like names are intentionally hidden. Requires ADMIN_API_KEY directly; normal API_KEY is not required.",
-      "/test-routing": "Protected routing-only end-to-end diagnostic. Exercises catalog, recommendation, artwork, lyrics, genre, routing, docs, and playback resolution paths. ARL health is handled separately by /arl-health. /testRouting and /testRoutings remain compatibility aliases."
     },
     playback: {
       quality_parameter: "quality or format",
@@ -4461,13 +4211,11 @@ function buildDocs(requestUrl, env) {
       secrets: "ARLs, client API keys, and ADMIN_API_KEY are credentials and should be stored as Cloudflare Secrets, not plaintext vars.",
       stream_proxy: "The /stream route is not an arbitrary fetch proxy. It requires HTTPS and an allowlisted Deezer CDN hostname.",
       query_keys: "Query-string API keys are disabled by default because URLs can be logged or cached. Enable ALLOW_QUERY_API_KEY only when a client cannot send headers. Generated playback URLs may still carry api_key for the authenticated stream flow; those responses are marked private/no-store and protected by short-lived playback authorization.",
-      admin: "/env is protected separately with ADMIN_API_KEY even when PUBLIC_API=true.",
       cors: "CORS is controlled by CORS_ALLOW_ORIGIN and defaults to *."
     },
     troubleshooting: {
       ping_fails: "Check DEEZER_ARL secrets first. Run /ping and inspect each configured slot's status and tier.",
       unauthorized: "Protected Deezer data routes require Authorization: Bearer <API_KEY> or X-API-Key when client keys are configured. Public informational routes such as /ping and /routing do not require a client API key.",
-      env_returns_403: "Supply ADMIN_API_KEY using Authorization: Bearer <ADMIN_API_KEY> or X-API-Key. /env never exposes secret values.",
       flac_falls_back: "The selected ARL may not have lossless capability, the Deezer media authorization may have expired, or the FLAC media URL request may have failed. /ping shows the detected account tier.",
       stream_rejected: "The /stream URL must use HTTPS and its hostname must match STREAM_CDN_HOSTS. The default allowlist is *.dzcdn.net and media.deezer.com.",
       stream_api_key: "When a request is authenticated with an API key, generated streamUrl values and stream redirects carry that same key as api_key so the returned URL can be opened directly. A short-lived stream_token is also attached and bound to that key, the track, and the caller IP. After successful token validation, the Worker can set an HttpOnly signed playback session cookie so subsequent Range requests do not depend on the URL token remaining unexpired. Playback routes accept these generated query parameters even when ALLOW_QUERY_API_KEY=false. Public API requests do not append client credentials.",
@@ -4501,9 +4249,7 @@ function routingInfo(env) {
     public_diagnostics: {
       docs: true,
       routing: true,
-      testRouting_aliases: ["/test-routing", "/testRouting", "/testRoutings"],
       env: false,
-      testRouting_authentication: "client API key unless PUBLIC_API=true with no configured API_KEY mappings"
     },
     recommendation_inputs: {
       supported_seed_parameters: ["id", "q", "query", "s", "isrc", "i", "title", "track", "song", "artist"],
@@ -4533,9 +4279,9 @@ function routingInfo(env) {
       quality_ladder: "FLAC -> MP3_320 -> MP3_128"
     },
     routes: {
-      GET: ["/", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/recommendations", "/cover", "/lyrics", "/stream-track", "/stream", "/track/:id/stream", "/track/:id/lyrics", "/ping", "/arl-health", "/device", "/routing", "/env", "/docs", "/config/", "/test-routing", "/testRoutings", "/testRouting"],
+      GET: ["/", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/recommendations", "/cover", "/lyrics", "/stream-track", "/stream", "/track/:id/stream", "/track/:id/lyrics", "/ping", "/arl-health", "/device", "/routing", "/docs", "/config/"],
       OPTIONS: ["/*"],
-      HEAD: ["/stream", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/cover", "/ping", "/arl-health", "/device", "/routing", "/env", "/docs", "/config/", "/test-routing", "/testRoutings", "/testRouting"]
+      HEAD: ["/stream", "/info", "/search", "/track", "/album", "/artist", "/playlist", "/chart", "/genre", "/radio", "/cover", "/ping", "/arl-health", "/device", "/routing", "/docs", "/config/"]
     },
     stream_security: {
       arbitrary_url_proxy: false,
@@ -4574,18 +4320,6 @@ const worker = {
     const segments = routePath.split("/").filter(Boolean);
     const primaryRoute = segments[0] || "";
 
-    if (isTestRoutingsPath(requestUrl)) {
-      const testAuth = authenticateTestRoutings(requestUrl, env);
-      if (!testAuth.authorized) return publicError("FORBIDDEN", 403, env, requestId);
-      const testKey = getTestRoutingPresentedKey(requestUrl);
-      const diagnosticTrackId = requestUrl.searchParams.get("track_id")?.trim() || "920991742";
-      if (request.method === "HEAD") {
-        return new Response(null, { status: 200, headers: { ...getCorsHeaders(env), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Request-ID": requestId } });
-      }
-      // /test-routing is intentionally a machine-readable routing-only diagnostic endpoint.
-      const diagnostics = await runTestRoutingsJson(request, env, requestUrl, diagnosticTrackId, testKey, testAuth.allowedSlots);
-      return jsonResponse(diagnostics, diagnostics.status === "complete" ? 200 : 502, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
-    }
 
     if (primaryRoute === "arl-health") {
       const { arls, mappings } = getMemoizedConfig(env);
@@ -4595,7 +4329,7 @@ const worker = {
         try {
           const session = await getOrRenewSession(item.value, env);
           return { slot:item.slot, variable:item.name, status:"active", tier:session.canLossless?"lossless":(session.can320?"320":"128"), capabilities:["MP3_128",...(session.can320?["MP3_320"]:[]),...(session.canLossless?["FLAC"]:[])], latency_ms:Date.now()-t };
-        } catch(error) { const d=testRoutingErrorDetails(error,502); return {slot:item.slot,variable:item.name,status:"failed",latency_ms:Date.now()-t,error:d}; }
+        } catch(error) { return {slot:item.slot,variable:item.name,status:"failed",latency_ms:Date.now()-t,error:{errorNumber:Number(error?.status||502)||502,errorCode:error?.code||null,errorText:String(error?.message||error||"Unknown error").slice(0,1000)}}; }
       }));
       const active=results.filter(x=>x.status==="active").length, failed=results.length-active;
       return jsonResponse({service:SERVICE_NAME,version:API_VERSION,status:failed===0&&results.length?"healthy":(active?"degraded":"unhealthy"),checked_at:new Date().toISOString(),health:{arls:{configured:results.length,active,failed,checked_in_parallel:true,results},bindings:{GENERAL_MUSIC_CACHE:Boolean(env?.GENERAL_MUSIC_CACHE),RATE_LIMITER:Boolean(env?.RATE_LIMITER)},configuration:{api_key_mappings:mappings.size,public_api:envBoolean(env,"PUBLIC_API",false),maintenance_mode:isMaintenanceMode(env),device_bound_signed_streams:deviceBoundStreamsEnabled(env)},runtime:{session_cache_entries:sessionCache.size,jwt_cache_entries:jwtCache.size,media_inflight:mediaInflight.size,track_token_inflight:trackTokenInflight.size,track_token_cache_entries:trackTokenCache.size,session_inflight:sessionInflight.size,catalog_inflight:catalogInflight.size,check_duration_ms:Date.now()-started}}},200,{"Cache-Control":"no-store","X-Request-ID":requestId},env);
@@ -4622,7 +4356,7 @@ const worker = {
       return request.method === "HEAD" ? new Response(null, { status: 200, headers }) : new Response(html, { status: 200, headers });
     }
 
-    if (request.method === "HEAD" && !["stream", "info", "search", "track", "album", "artist", "playlist", "chart", "genre", "radio", "cover", "ping", "arl-health", "device", "routing", "env", "docs", "config", "test-routing", "testRoutings", "testRouting"].includes((requestUrl.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || ""))) {
+    if (request.method === "HEAD" && !["stream", "info", "search", "track", "album", "artist", "playlist", "chart", "genre", "radio", "cover", "ping", "arl-health", "device", "routing", "docs", "config"].includes((requestUrl.pathname.replace(/^\/+|\/+$/g, "").split("/")[0] || ""))) {
       return new Response(null, { status: 404, headers: { ...getCorsHeaders(env), "X-Request-ID": requestId } });
     }
 
@@ -4637,15 +4371,14 @@ const worker = {
     const isPublicRouting = primaryRoute === "routing";
     const isPublicPing = primaryRoute === "ping" || requestUrl.searchParams.has("ping");
     const isPublicArlHealth = primaryRoute === "arl-health";
-    const isAdminEnv = primaryRoute === "env";
     // /ping is intentionally credential-free. It performs an ARL health/capability
     // check but never returns a Deezer streamUrl, media URL, track token, lyrics,
     // catalog payload, or other protected Deezer data to the caller.
-    const auth = (isPublicRouting || isPublicPing || isPublicArlHealth || isAdminEnv)
+    const auth = (isPublicRouting || isPublicPing || isPublicArlHealth)
       ? {
           authorized: true,
           allowedSlots: null,
-          tokenId: isPublicRouting ? "public-routing" : (isPublicPing ? "public-ping" : (isPublicArlHealth ? "public-arl-health" : "admin-env"))
+          tokenId: isPublicRouting ? "public-routing" : (isPublicPing ? "public-ping" : "public-arl-health")
         }
       : authenticateRequest(request, env);
     if (!auth.authorized) {
@@ -4689,34 +4422,6 @@ const worker = {
 
     if (primaryRoute === "routing") {
       const response = jsonResponse(routingInfo(env), 200, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
-      return request.method === "HEAD" ? new Response(null, { status: response.status, headers: response.headers }) : response;
-    }
-    if (primaryRoute === "env") {
-      const presented = getPresentedApiToken(request, env);
-      const configuredAdmin = String(env?.ADMIN_API_KEY || "").trim();
-      if (!configuredAdmin || !presented || presented !== configuredAdmin) return publicError("FORBIDDEN", 403, env, requestId);
-      const response = jsonResponse({ service: SERVICE_NAME, version: API_VERSION, variables: diagnosticEnv(env), variableDocumentation: ENVIRONMENT_VARIABLES, streamTokenSecurity: STREAM_TOKEN_SECURITY_NOTE, secret_variables: ["DEEZER_ARL[_1..50]", "API_KEY[_1..50]", "ADMIN_API_KEY", "STREAM_TOKEN_SECRET"] }, 200, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
-      return request.method === "HEAD" ? new Response(null, { status: response.status, headers: response.headers }) : response;
-    }
-
-
-    if (primaryRoute === "ping" || requestUrl.searchParams.has("ping")) {
-      // Cheap liveness only. Live Deezer ARL validation belongs to /arl-health.
-      const { arls } = getMemoizedConfig(env);
-      const shared = arls.filter(item => item.shared === true).length;
-      const local = arls.length - shared;
-      const configuredQuality = String(env?.DEFAULT_QUALITY || "best").trim().toLowerCase() || "best";
-      const response = jsonResponse({
-        service: SERVICE_NAME,
-        version: API_VERSION,
-        status: arls.length > 0 ? "healthy" : "degraded",
-        configured: arls.length,
-        local,
-        shared,
-        configured_quality: configuredQuality,
-        maintenance: isMaintenanceMode(env),
-        timestamp: new Date().toISOString(),
-      }, arls.length > 0 ? 200 : 503, { "Cache-Control": "no-store", "X-Request-ID": requestId }, env);
       return request.method === "HEAD" ? new Response(null, { status: response.status, headers: response.headers }) : response;
     }
 
